@@ -20,7 +20,7 @@ ALPACA_ENDPOINT = "https://paper-api.alpaca.markets/v2"
 After deployment, put the Streamlit URL here:
 
 ```text
-Live dashboard: <add Streamlit app URL>
+Live dashboard: (https://trade-researcher.streamlit.app/)
 ```
 
 ## Pages
