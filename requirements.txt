@@ -1,0 +1,9 @@
+flask>=3.0
+yfinance>=0.2
+pandas>=2.0
+numpy>=1.26
+plotly>=5.20
+requests>=2.31
+beautifulsoup4>=4.12
+hmmlearn>=0.3
+scikit-learn>=1.4

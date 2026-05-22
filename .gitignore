@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+*.log
+alpaca_credentials.env
+alpaca_live_cache.json
+dashboard_data/
+trading_strategy_dashboard.html
+transcript_extracted.txt
+*.tmp
