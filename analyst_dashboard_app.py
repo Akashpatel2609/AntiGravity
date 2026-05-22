@@ -295,7 +295,7 @@ def run_markov_model(ticker: str, years: int = 10, window: int = 20, threshold: 
         "state": [MARKOV_STATES[int(x)] for x in labels.to_numpy()],
         "stateId": labels.to_numpy(dtype=int),
         "close": close.reindex(labels.index).round(2).to_numpy(),
-    }).tail(520)
+    })
     hmm_result = markov_fit_hmm(close) if include_hmm else {"available": False, "message": "HMM skipped by request."}
     return {
         "ticker": ticker,
@@ -402,8 +402,9 @@ def fusion_verdict(transcript: dict, markov: dict) -> dict:
 
 
 def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02) -> dict:
-    price = add_indicators(download(ticker, "5y"))
-    spy = add_indicators(download("SPY", "5y"))
+    history_period = f"{max(1, int(years))}y"
+    price = add_indicators(download(ticker, history_period))
+    spy = add_indicators(download("SPY", history_period))
     market = market_context()
     latest = price.iloc[-1]
     prev = price.iloc[-2]
@@ -838,13 +839,16 @@ def cycle_phase_model(score: float, sentiment_score: int, market: dict, latest: 
 
 
 def chart_payload(df: pd.DataFrame, ticker: str):
-    recent = df.tail(520).copy()
+    recent = df.copy()
     dates = [d.strftime("%Y-%m-%d") for d in recent.index]
     recent["DD"] = recent["Close"] / recent["Close"].cummax() - 1
     return {
         "ticker": ticker,
         "dates": dates,
-        "close": recent["Close"].round(2).fillna("").tolist(),
+        "open": recent["Open"].round(2).replace({np.nan: None}).tolist(),
+        "high": recent["High"].round(2).replace({np.nan: None}).tolist(),
+        "low": recent["Low"].round(2).replace({np.nan: None}).tolist(),
+        "close": recent["Close"].round(2).replace({np.nan: None}).tolist(),
         "sma50": recent["SMA50"].round(2).replace({np.nan: None}).tolist(),
         "sma200": recent["SMA200"].round(2).replace({np.nan: None}).tolist(),
         "rsi": recent["RSI14"].round(1).replace({np.nan: None}).tolist(),

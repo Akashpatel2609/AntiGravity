@@ -4,7 +4,9 @@ import os
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 from analyst_dashboard_app import (
     build_fusion_payload,
@@ -61,6 +63,7 @@ def css() -> None:
             min-height: 128px;
         }
         .phase-card.active { border-color: #2dd4bf; background: #10221f; }
+        .big-verdict { font-size: 1.5rem; font-weight: 800; margin-bottom: 8px; }
         .muted { color: #a1a1aa; }
         .good { color: #34d399; font-weight: 800; }
         .warn { color: #f59e0b; font-weight: 800; }
@@ -83,7 +86,21 @@ def dark_layout(title: str, ytitle: str) -> dict:
         hovermode="x unified",
         height=480,
         margin=dict(l=54, r=30, t=54, b=42),
-        xaxis=dict(gridcolor="#2a2a2a"),
+        xaxis=dict(
+            gridcolor="#2a2a2a",
+            rangeslider=dict(visible=False),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(count=1, label="1Y", step="year", stepmode="backward"),
+                    dict(count=5, label="5Y", step="year", stepmode="backward"),
+                    dict(step="all", label="All"),
+                ],
+                bgcolor="#222226",
+                activecolor="#2dd4bf",
+                font=dict(color="#f4f4f5"),
+            ),
+        ),
         yaxis=dict(title=ytitle, gridcolor="#2a2a2a", zerolinecolor="#444"),
         legend=dict(orientation="h"),
     )
@@ -121,17 +138,50 @@ def shock_annotations(events: list[dict], y_max: float) -> list[dict]:
     ]
 
 
-def price_fusion_chart(payload: dict, window_label: str, show_events: bool, show_ma: bool) -> go.Figure:
+def window_size(label: str, total: int) -> int:
+    sizes = {"3M": 63, "6M": 126, "1Y": 252, "2Y": 520, "5Y": 1260, "10Y": 2520, "20Y": 5040, "30Y": 7560}
+    return min(sizes.get(label, total), total)
+
+
+def price_fusion_chart(
+    payload: dict,
+    window_label: str,
+    show_events: bool,
+    show_ma: bool,
+    log_scale: bool,
+) -> go.Figure:
     chart = payload["transcript"]["chart"]
     markov = payload["markov"]
-    n = {"6M": 126, "1Y": 252, "2Y": 520, "5Y": 1260}.get(window_label, 252)
+    n = window_size(window_label, len(chart["dates"]))
     dates = chart["dates"][-n:]
     close = chart["close"][-n:]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=dates, y=close, mode="lines", name="Close", line=dict(color="#2dd4bf", width=2.4)))
+    fig = make_subplots(
+        rows=4,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.035,
+        row_heights=[0.56, 0.16, 0.14, 0.14],
+        specs=[[{"secondary_y": False}], [{}], [{}], [{}]],
+    )
+    fig.add_trace(
+        go.Candlestick(
+            x=dates,
+            open=chart["open"][-n:],
+            high=chart["high"][-n:],
+            low=chart["low"][-n:],
+            close=close,
+            name="OHLC",
+            increasing_line_color="#34d399",
+            decreasing_line_color="#fb7185",
+            increasing_fillcolor="#34d399",
+            decreasing_fillcolor="#fb7185",
+        ),
+        row=1,
+        col=1,
+    )
     if show_ma:
-        fig.add_trace(go.Scatter(x=dates, y=chart["sma50"][-n:], mode="lines", name="50DMA", line=dict(color="#60a5fa")))
-        fig.add_trace(go.Scatter(x=dates, y=chart["sma200"][-n:], mode="lines", name="200DMA", line=dict(color="#f59e0b")))
+        fig.add_trace(go.Scatter(x=dates, y=chart["sma50"][-n:], mode="lines", name="50DMA", line=dict(color="#60a5fa")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=chart["sma200"][-n:], mode="lines", name="200DMA", line=dict(color="#f59e0b")), row=1, col=1)
     state_colors = {"Bear": "#fb7185", "Sideways": "#f59e0b", "Bull": "#34d399"}
     regime = [r for r in markov["regimeSeries"] if r["date"] in set(dates)]
     for state in ("Bear", "Sideways", "Bull"):
@@ -143,14 +193,47 @@ def price_fusion_chart(payload: dict, window_label: str, show_events: bool, show
                 mode="markers",
                 name=f"Markov {state}",
                 marker=dict(color=state_colors[state], size=6, symbol="square"),
-            )
+            ),
+            row=1,
+            col=1,
+        )
+    volume_colors = [
+        "#34d399" if (chart["close"][-n:][i] or 0) >= (chart["open"][-n:][i] or 0) else "#fb7185"
+        for i in range(len(dates))
+    ]
+    fig.add_trace(go.Bar(x=dates, y=chart["volume"][-n:], name="Volume", marker_color=volume_colors), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=chart["rsi"][-n:], mode="lines", name="RSI 14", line=dict(color="#a78bfa")), row=3, col=1)
+    fig.add_hrect(y0=70, y1=100, fillcolor="rgba(251,113,133,.12)", line_width=0, row=3, col=1)
+    fig.add_hrect(y0=0, y1=30, fillcolor="rgba(52,211,153,.10)", line_width=0, row=3, col=1)
+    fig.add_trace(
+        go.Scatter(x=dates, y=[x * 100 if x is not None else None for x in chart["drawdown"][-n:]], mode="lines", name="Drawdown", line=dict(color="#f97316")),
+        row=4,
+        col=1,
+    )
+    live = payload["transcript"]["liveQuote"]
+    live_price = live.get("last") or live.get("mid")
+    if live_price:
+        fig.add_hline(
+            y=live_price,
+            line_dash="dot",
+            line_color="#f8fafc",
+            annotation_text=f"Live {live_price:.2f}",
+            annotation_position="top left",
+            row=1,
+            col=1,
         )
     y_values = [x for x in close if isinstance(x, (int, float))]
     layout = dark_layout(f"{payload['ticker']} Final Price Workbench", "Price")
+    layout["height"] = 760
     if show_events and y_values:
         layout["shapes"] = shock_shapes(markov["events"], min(y_values), max(y_values))
         layout["annotations"] = shock_annotations(markov["events"], max(y_values))
     fig.update_layout(**layout)
+    fig.update_xaxes(rangeslider_visible=False)
+    fig.update_yaxes(title_text="Price", type="log" if log_scale else "linear", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    fig.update_yaxes(title_text="Drawdown %", row=4, col=1)
     return fig
 
 
@@ -191,7 +274,7 @@ def fmt_percent(value: float | None, digits: int = 2) -> str:
     return f"{value * 100:.{digits}f}%"
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def cached_fusion(ticker: str, years: int, window: int, threshold: float) -> dict:
     return build_fusion_payload(ticker, years=years, window=window, threshold=threshold)
 
@@ -204,12 +287,17 @@ def cached_markov(ticker: str, years: int, window: int, threshold: float, hmm: b
 st.sidebar.title("AntiGravity")
 page = st.sidebar.radio("Page", ["Final Verdict", "Markov Model", "Cycle Cheatsheet"])
 ticker = st.sidebar.text_input("Ticker", "SPY").strip().upper() or "SPY"
-years = st.sidebar.slider("History years", 1, 30, 10)
+years = st.sidebar.slider("History years", 1, 30, 30)
 window = st.sidebar.slider("Markov rolling window", 5, 252, 20)
 threshold = st.sidebar.slider("Regime threshold", 0.001, 0.25, 0.02, 0.001)
 show_events = st.sidebar.toggle("Show shock events", True)
 show_ma = st.sidebar.toggle("Show moving averages", True)
-window_label = st.sidebar.selectbox("Chart window", ["6M", "1Y", "2Y", "5Y"], index=1)
+log_scale = st.sidebar.toggle("Log price scale", False)
+auto_refresh = st.sidebar.toggle("Auto-refresh every 5 minutes", True)
+window_label = st.sidebar.selectbox("Chart window", ["3M", "6M", "1Y", "2Y", "5Y", "10Y", "20Y", "30Y", "All"], index=8)
+
+if auto_refresh:
+    components.html("<script>setTimeout(() => window.parent.location.reload(), 300000)</script>", height=0)
 
 st.title("AntiGravity Stock Research Dashboard")
 st.caption("Transcript cycle model + Markov regimes + macro/sentiment + shock-event robustness.")
@@ -228,13 +316,19 @@ if page == "Final Verdict":
     c3.metric("Final score", f"{final['score']}/100", final["verdict"])
     c4.metric("Transcript phase", transcript["phaseModel"]["current"].replace(" - ", " | "))
     c5.metric("Markov state", markov["currentState"], f"Sharpe {fmt_number(markov['walkForward'].get('sharpe'))}")
+    st.caption(
+        f"Historical range: {markov['start']} to {markov['end']} | "
+        f"{markov['rows']:,} daily bars | "
+        f"Quote source: {transcript['liveQuote'].get('source', 'yfinance fallback')} | "
+        f"Quote time: {transcript['liveQuote'].get('timestamp') or 'latest daily close'}"
+    )
 
     left, right = st.columns([1.35, 0.85])
     with left:
-        st.plotly_chart(price_fusion_chart(data, window_label, show_events, show_ma), use_container_width=True)
+        st.plotly_chart(price_fusion_chart(data, window_label, show_events, show_ma, log_scale), use_container_width=True)
     with right:
         st.markdown("### Final Verdict")
-        st.markdown(f"<div class='card'><div class='metric'>{final['verdict']}</div><p>{final['action']}</p></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='card'><div class='big-verdict'>{final['verdict']}</div><p>{final['action']}</p></div>", unsafe_allow_html=True)
         st.markdown("### Evidence")
         for item in final["evidence"]:
             st.write(f"- {item}")
