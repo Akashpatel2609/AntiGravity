@@ -2,6 +2,27 @@
 
 Local stock research dashboard built with Flask, Plotly, yfinance, Alpaca live data, a transcript-inspired market-cycle model, and an observable Markov regime model.
 
+## Hosted dashboard
+
+Use Streamlit Community Cloud for the free hosted version, especially while the repository is private.
+
+1. Go to [share.streamlit.io](https://share.streamlit.io/).
+2. Connect GitHub and choose `Akashpatel2609/AntiGravity`.
+3. Set the main file path to `streamlit_app.py`.
+4. Add these app secrets if you want Alpaca live/after-hours data:
+
+```toml
+ALPACA_API_KEY = "your_key"
+ALPACA_SECRET_KEY = "your_secret"
+ALPACA_ENDPOINT = "https://paper-api.alpaca.markets/v2"
+```
+
+After deployment, put the Streamlit URL here:
+
+```text
+Live dashboard: <add Streamlit app URL>
+```
+
 ## Pages
 
 - `/` - ticker research dashboard with live price, sentiment, macro, technicals, and six-stage bull/bear cycle scoring.
@@ -29,6 +50,12 @@ Open:
 
 ```text
 http://127.0.0.1:8766/
+```
+
+## Run with Streamlit
+
+```powershell
+streamlit run streamlit_app.py
 ```
 
 Optional Alpaca CLI feeder:
