@@ -281,6 +281,7 @@ def run_markov_model(ticker: str, years: int = 10, window: int = 20, threshold: 
     labels = markov_label_regimes(close, window=window, threshold=threshold)
     P = markov_transition_matrix(labels)
     stationary = markov_stationary_distribution(P)
+    forecast_3 = np.linalg.matrix_power(P, 3)
     forecast_5 = np.linalg.matrix_power(P, 5)
     forecast_20 = np.linalg.matrix_power(P, 20)
     walk = markov_walk_forward(close, labels)
@@ -310,6 +311,7 @@ def run_markov_model(ticker: str, years: int = 10, window: int = 20, threshold: 
         "matrix": np.round(P, 4).tolist(),
         "stationary": [{"state": MARKOV_STATES[i], "probability": round(float(stationary[i]) * 100, 2)} for i in range(3)],
         "nextDay": [{"state": MARKOV_STATES[i], "probability": round(float(next_probs[i]) * 100, 2)} for i in range(3)],
+        "forecast3": np.round(forecast_3, 4).tolist(),
         "forecast5": np.round(forecast_5, 4).tolist(),
         "forecast20": np.round(forecast_20, 4).tolist(),
         "persistence": [{"state": MARKOV_STATES[i], "probability": round(float(P[i, i]) * 100, 2)} for i in range(3)],
@@ -371,6 +373,33 @@ def fusion_verdict(transcript: dict, markov: dict) -> dict:
     elif vix < 18:
         score += 4
     score -= event_penalty
+
+    # Live Sentiment Adjustment
+    sentiment = transcript.get("sentiment", {})
+    sentiment_score = sentiment.get("score", 0)
+    sentiment_label = sentiment.get("label", "Neutral")
+    
+    sentiment_adj = 0
+    if sentiment_label == "Positive":
+        sentiment_adj = min(8, sentiment_score * 0.5)
+    elif sentiment_label == "Negative":
+        sentiment_adj = max(-12, sentiment_score * 0.7)
+        
+    score += sentiment_adj
+    
+    # Live Intraday Change Adjustment
+    live_price = transcript.get("price")
+    last_close = transcript.get("lastClose")
+    intraday_adj = 0
+    intraday_change = 0.0
+    if live_price and last_close:
+        intraday_change = (live_price / last_close - 1)
+        if intraday_change > 0.015:
+            intraday_adj = min(6, intraday_change * 150)
+        elif intraday_change < -0.015:
+            intraday_adj = max(-10, intraday_change * 200)
+            
+    score += intraday_adj
     score = max(0, min(100, score))
 
     if score >= 72:
@@ -395,13 +424,16 @@ def fusion_verdict(transcript: dict, markov: dict) -> dict:
         f"Walk-forward Sharpe: {sharpe:.3f}" if sharpe is not None else "Walk-forward Sharpe unavailable.",
         f"Max drawdown: {max_dd * 100:.2f}%" if max_dd is not None else "Max drawdown unavailable.",
         f"Event-adjusted Sharpe: {clean_sharpe:.3f}" if clean_sharpe is not None else "Event-adjusted Sharpe unavailable.",
+        f"Live news & social sentiment: {sentiment_label} (combined score {sentiment_score:+.1f}, adjustment: {sentiment_adj:+.1f} points).",
     ]
+    if intraday_change != 0.0:
+        evidence.append(f"Live intraday change: {intraday_change*100:+.2f}% (adjustment: {intraday_adj:+.1f} points).")
     if event_penalty:
         evidence.append("Shock-window robustness penalty applied because performance weakened after excluding major event windows.")
     return {"score": round(score, 1), "verdict": verdict, "action": action, "evidence": evidence}
 
 
-def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02) -> dict:
+def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = True) -> dict:
     history_period = f"{max(1, int(years))}y"
     price = add_indicators(download(ticker, history_period))
     spy = add_indicators(download("SPY", history_period))
@@ -409,12 +441,12 @@ def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, thresho
     latest = price.iloc[-1]
     prev = price.iloc[-2]
     rel_6m = safe_float(latest.get("RET_6M")) - safe_float(spy.iloc[-1].get("RET_6M"), 0)
-    sentiment = get_news_sentiment(ticker)
+    sentiment = get_consolidated_sentiment(ticker)
     catalysts = catalyst_tags(sentiment["items"])
     live_quote = alpaca_latest_quote(ticker)
     display_price = live_quote.get("last") or live_quote.get("mid") or safe_float(latest["Close"])
     verdict, score, checks = indicator_verdict(latest, pd.Series(market), rel_6m)
-    phase_model = cycle_phase_model(score, sentiment["score"], market, latest, checks, catalysts)
+    phase_model = cycle_phase_model(score, sentiment["news_score"], market, latest, checks, catalysts)
     transcript = {
         "ticker": ticker,
         "price": round(safe_float(display_price), 2),
@@ -431,7 +463,7 @@ def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, thresho
         "chart": chart_payload(price, ticker),
         "liveQuote": live_quote,
     }
-    markov = run_markov_model(ticker, years=years, window=window, threshold=threshold, include_hmm=True)
+    markov = run_markov_model(ticker, years=years, window=window, threshold=threshold, include_hmm=include_hmm)
     final = fusion_verdict(transcript, markov)
     return {
         "ticker": ticker,
@@ -466,6 +498,88 @@ def get_news_sentiment(ticker: str):
     elif total <= -2:
         label = "Negative"
     return {"label": label, "score": total, "items": rows}
+
+
+def get_reddit_sentiment(ticker: str) -> dict:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    url = f"https://www.reddit.com/r/stocks+wallstreetbets+investing/search.json?q={ticker}&restrict_sr=1&sort=new&limit=15"
+    try:
+        r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code != 200:
+            url = f"https://www.reddit.com/search.json?q={ticker}&sort=new&limit=15"
+            r = requests.get(url, headers=headers, timeout=8)
+        if r.status_code == 200:
+            posts = r.json().get("data", {}).get("children", [])
+            rows = []
+            total = 0
+            for post in posts:
+                pdata = post.get("data", {})
+                title = pdata.get("title") or ""
+                selftext = pdata.get("selftext") or ""
+                permalink = pdata.get("permalink") or ""
+                subreddit = pdata.get("subreddit") or ""
+                created_utc = pdata.get("created_utc")
+                full_text = (title + " " + selftext).lower()
+                pos = sum(1 for w in POSITIVE_WORDS if w in full_text)
+                neg = sum(1 for w in NEGATIVE_WORDS if w in full_text)
+                score = pos - neg
+                total += score
+                rows.append({
+                    "title": title,
+                    "publisher": f"r/{subreddit}",
+                    "link": f"https://reddit.com{permalink}",
+                    "score": score,
+                    "published": datetime.fromtimestamp(created_utc, timezone.utc).isoformat() if created_utc else ""
+                })
+            label = "Neutral"
+            if total >= 2:
+                label = "Positive"
+            elif total <= -2:
+                label = "Negative"
+            return {"label": label, "score": total, "items": rows}
+    except Exception:
+        pass
+    return {"label": "Neutral", "score": 0, "items": []}
+
+
+def get_consolidated_sentiment(ticker: str) -> dict:
+    news = get_news_sentiment(ticker)
+    reddit = get_reddit_sentiment(ticker)
+    
+    combined_score = news["score"] + reddit["score"]
+    combined_items = []
+    for item in news["items"]:
+        combined_items.append({
+            "title": item["title"],
+            "publisher": item.get("publisher") or "Yahoo Finance",
+            "link": item["link"],
+            "score": item["score"],
+            "published": item["published"],
+            "type": "news"
+        })
+    for item in reddit["items"]:
+        combined_items.append({
+            "title": item["title"],
+            "publisher": item["publisher"],
+            "link": item["link"],
+            "score": item["score"],
+            "published": item["published"],
+            "type": "reddit"
+        })
+    
+    label = "Neutral"
+    if combined_score >= 3:
+        label = "Positive"
+    elif combined_score <= -3:
+        label = "Negative"
+        
+    return {
+        "label": label,
+        "score": combined_score,
+        "news_score": news["score"],
+        "reddit_score": reddit["score"],
+        "items": combined_items
+    }
 
 
 def catalyst_tags(news_items: list[dict]) -> list[dict]:
@@ -682,6 +796,27 @@ def alpaca_latest_quote(ticker: str) -> dict:
         return cli_quote
     headers = alpaca_headers()
     if not headers:
+        try:
+            raw_info = yf.Ticker(ticker).fast_info
+            last_price = raw_info.get("last_price")
+            prev_close = raw_info.get("previous_close")
+            if last_price is not None:
+                return {
+                    "enabled": True,
+                    "source": "yfinance (Free Live Quote)",
+                    "feed": "yfinance real-time",
+                    "last": float(last_price),
+                    "bid": None,
+                    "ask": None,
+                    "mid": float(last_price),
+                    "bidSize": None,
+                    "askSize": None,
+                    "prevClose": float(prev_close) if prev_close else None,
+                    "volume": float(raw_info.get("last_volume", 0)),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+        except Exception as exc:
+            return {"enabled": False, "source": "yfinance fallback", "error": f"Alpaca credentials missing & yfinance failed: {exc}"}
         return {"enabled": False, "source": "yfinance fallback", "error": "Alpaca credentials not configured"}
     quote_url = f"https://data.alpaca.markets/v2/stocks/{ticker}/quotes/latest"
     trade_url = f"https://data.alpaca.markets/v2/stocks/{ticker}/trades/latest"
@@ -720,6 +855,27 @@ def alpaca_latest_quote(ticker: str) -> dict:
             "timestamp": trade.get("t") or quote.get("t"),
         }
     except Exception as exc:
+        try:
+            raw_info = yf.Ticker(ticker).fast_info
+            last_price = raw_info.get("last_price")
+            prev_close = raw_info.get("previous_close")
+            if last_price is not None:
+                return {
+                    "enabled": True,
+                    "source": "yfinance (Free Live Quote) Fallback",
+                    "feed": "yfinance real-time",
+                    "last": float(last_price),
+                    "bid": None,
+                    "ask": None,
+                    "mid": float(last_price),
+                    "bidSize": None,
+                    "askSize": None,
+                    "prevClose": float(prev_close) if prev_close else None,
+                    "volume": float(raw_info.get("last_volume", 0)),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+        except Exception:
+            pass
         return {"enabled": True, "source": "yfinance fallback", "error": str(exc)}
 
 
@@ -869,12 +1025,12 @@ def analyze():
     latest = price.iloc[-1]
     prev = price.iloc[-2]
     rel_6m = safe_float(latest.get("RET_6M")) - safe_float(spy.iloc[-1].get("RET_6M"), 0)
-    sentiment = get_news_sentiment(ticker)
+    sentiment = get_consolidated_sentiment(ticker)
     live_quote = alpaca_latest_quote(ticker)
     display_price = live_quote.get("last") or live_quote.get("mid") or safe_float(latest["Close"])
     verdict, score, checks = indicator_verdict(latest, pd.Series(market), rel_6m)
     catalysts = catalyst_tags(sentiment["items"])
-    phase_model = cycle_phase_model(score, sentiment["score"], market, latest, checks, catalysts)
+    phase_model = cycle_phase_model(score, sentiment["news_score"], market, latest, checks, catalysts)
     info = {}
     try:
         raw_info = yf.Ticker(ticker).fast_info
@@ -972,7 +1128,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Wall Street Style Cycle Research Dashboard</title>
+  <title>Trade Researcher Bot - Cycle Diagnostics</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {
@@ -1037,9 +1193,9 @@ HTML = r"""
 <header>
   <div class="header-inner">
     <div>
-      <h1>Cycle Research Dashboard</h1>
-      <div class="sub">Ticker diagnostics, sentiment, macro regime, indicator verdict, and next-phase probability.</div>
-      <div class="sub"><a href="/fusion">Final verdict dashboard</a> · <a href="/markov-skill">Markov regime model</a></div>
+      <h1>Trade Researcher Bot - Cycle Diagnostics</h1>
+      <div class="sub">State of the art market research, sentiment analysis, cycle diagnostics, and regime transitions.</div>
+      <div class="sub"><a href="/fusion">Consensus Verdict</a> · <a href="/markov-skill">Markov Regimes</a></div>
     </div>
     <form id="tickerForm">
       <input id="tickerInput" value="NVDA" aria-label="Ticker" />
@@ -1229,16 +1385,16 @@ function renderCharts() {
   if (!currentData) return;
   const c = sliceChart(currentData.chart);
   const priceTraces = [
-    {x:c.dates, y:c.close, name:'Close', type:'scatter', mode:'lines', line:{color:'#2dd4bf', width:2.4}, hovertemplate:'Close %{y}<extra></extra>'}
+    {x:c.dates, y:c.close, name:'Close', type:'scatter', mode:'lines', line:{color:'#2dd4bf', width:2.4}, hovertemplate:'%{x}<br>Close: $%{y:.2f}<extra></extra>'}
   ];
   if (chartPrefs.ma) {
     priceTraces.push(
-      {x:c.dates, y:c.sma50, name:'50DMA', type:'scatter', mode:'lines', line:{color:'#60a5fa', width:1.5}},
-      {x:c.dates, y:c.sma200, name:'200DMA', type:'scatter', mode:'lines', line:{color:'#f59e0b', width:1.5}}
+      {x:c.dates, y:c.sma50, name:'50DMA', type:'scatter', mode:'lines', line:{color:'#60a5fa', width:1.5}, hovertemplate:'%{x}<br>50DMA: $%{y:.2f}<extra></extra>'},
+      {x:c.dates, y:c.sma200, name:'200DMA', type:'scatter', mode:'lines', line:{color:'#f59e0b', width:1.5}, hovertemplate:'%{x}<br>200DMA: $%{y:.2f}<extra></extra>'}
     );
   }
   if (chartPrefs.volume) {
-    priceTraces.push({x:c.dates, y:c.volume, name:'Volume', type:'bar', yaxis:'y2', marker:{color:'rgba(148,163,184,.28)'}, opacity:.65});
+    priceTraces.push({x:c.dates, y:c.volume, name:'Volume', type:'bar', yaxis:'y2', marker:{color:'rgba(148,163,184,.28)'}, opacity:.65, hovertemplate:'%{x}<br>Volume: %{y}<extra></extra>'});
   }
   const lastDate = c.dates[c.dates.length - 1];
   const layout = darkLayout(`${currentData.ticker} Analyst Price Workbench`, 'Price');
@@ -1253,16 +1409,16 @@ function renderCharts() {
 
   const momTraces = [];
   if (chartPrefs.rsi) {
-    momTraces.push({x:c.dates, y:c.rsi, name:'RSI 14', type:'scatter', mode:'lines', yaxis:'y', line:{color:'#a78bfa'}});
+    momTraces.push({x:c.dates, y:c.rsi, name:'RSI 14', type:'scatter', mode:'lines', yaxis:'y', line:{color:'#a78bfa'}, hovertemplate:'%{x}<br>RSI 14: %{y:.2f}<extra></extra>'});
   }
   if (chartPrefs.macd) {
     momTraces.push(
-      {x:c.dates, y:c.macd, name:'MACD', type:'scatter', mode:'lines', yaxis:'y2', line:{color:'#2dd4bf'}},
-      {x:c.dates, y:c.macdSignal, name:'MACD signal', type:'scatter', mode:'lines', yaxis:'y2', line:{color:'#fb7185'}}
+      {x:c.dates, y:c.macd, name:'MACD', type:'scatter', mode:'lines', yaxis:'y2', line:{color:'#2dd4bf'}, hovertemplate:'%{x}<br>MACD: %{y:.2f}<extra></extra>'},
+      {x:c.dates, y:c.macdSignal, name:'MACD signal', type:'scatter', mode:'lines', yaxis:'y2', line:{color:'#fb7185'}, hovertemplate:'%{x}<br>Signal: %{y:.2f}<extra></extra>'}
     );
   }
   if (chartPrefs.drawdown) {
-    momTraces.push({x:c.dates, y:c.drawdown.map(v => v === null ? null : v * 100), name:'Drawdown %', type:'scatter', mode:'lines', yaxis:'y3', fill:'tozeroy', line:{color:'#f59e0b', width:1.4}});
+    momTraces.push({x:c.dates, y:c.drawdown.map(v => v === null ? null : v * 100), name:'Drawdown %', type:'scatter', mode:'lines', yaxis:'y3', fill:'tozeroy', line:{color:'#f59e0b', width:1.4}, hovertemplate:'%{x}<br>Drawdown: %{y:.2f}%<extra></extra>'});
   }
   const momLayout = darkLayout('Momentum + Damage Workbench', 'RSI');
   momLayout.yaxis.range = [0, 100];
@@ -1334,7 +1490,7 @@ MARKOV_PROMPT_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Markov Hedge Fund Method</title>
+  <title>Trade Researcher Bot - Markov Regimes</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {
@@ -1383,10 +1539,10 @@ MARKOV_PROMPT_HTML = r"""
 <header>
   <div class="header-inner">
     <div>
-      <h1>Markov Hedge Fund Method</h1>
+      <h1>Trade Researcher Bot - Markov Regimes</h1>
       <div class="sub">Observable Markov regimes, stationary distribution, n-step forecast, walk-forward backtest, optional HMM.</div>
     </div>
-    <a class="pill" href="/">Back to dashboard</a>
+    <a class="pill" href="/">Back to diagnostics</a>
   </div>
 </header>
 <main>
@@ -1485,11 +1641,20 @@ function renderRegimeChart(data) {
     mode: 'lines',
     type: 'scatter',
     name: 'Close',
-    line: { color: '#2dd4bf', width: 2 }
+    line: { color: '#2dd4bf', width: 2 },
+    hovertemplate: '%{x}<br>Close: $%{y:.2f}<extra></extra>'
   }];
   states.forEach((state, id) => {
     const pts = data.regimeSeries.filter(r => r.stateId === id);
-    traces.push({ x: pts.map(r => r.date), y: pts.map(r => r.close), mode:'markers', type:'scatter', name: state, marker:{color:colors[state], size:5} });
+    traces.push({
+      x: pts.map(r => r.date),
+      y: pts.map(r => r.close),
+      mode: 'markers',
+      type: 'scatter',
+      name: state,
+      marker: { color: colors[state], size: 4, symbol: 'circle', opacity: 0.7 },
+      hovertemplate: '%{x}<br>Price: $%{y:.2f}<br>Regime: ' + state + '<extra></extra>'
+    });
   });
   Plotly.react('regimeChart', traces, darkLayout(`${data.ticker} Price With Observable Regime Labels`, 'Close'), {displayModeBar:true, responsive:true, scrollZoom:true});
 }
@@ -1514,7 +1679,7 @@ FUSION_HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Final Verdict Dashboard</title>
+  <title>Trade Researcher Bot - Consensus Verdict</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root { --bg:#09090b; --panel:#141417; --panel2:#1e1e22; --line:#303036; --ink:#f4f4f5; --muted:#a1a1aa; --accent:#2dd4bf; --blue:#60a5fa; --amber:#f59e0b; --red:#fb7185; --green:#34d399; }
@@ -1558,9 +1723,9 @@ FUSION_HTML = r"""
 <header>
   <div class="header-inner">
     <div>
-      <h1>Final Verdict Dashboard</h1>
-      <div class="sub">Blends transcript cycle strategy, Markov regimes, macro, sentiment, and market-shock awareness.</div>
-      <div class="sub"><a href="/">Cycle dashboard</a> · <a href="/markov-skill">Markov model</a></div>
+      <h1>Consensus Verdict Dashboard</h1>
+      <div class="sub">Consensus scorecard blending cycle phases, Markov transitions, social/news sentiment, and shock-event robustness.</div>
+      <div class="sub"><a href="/">Cycle Diagnostics</a> · <a href="/markov-skill">Markov Regimes</a></div>
     </div>
     <form id="fusionForm">
       <label>Ticker <input id="ticker" value="SPY"></label>
@@ -1676,10 +1841,26 @@ function eventAnnotations(yMax){
 function renderFusionChart(){
   const c = current.transcript.chart;
   const dates = slice(c.dates), close = slice(c.close), sma50 = slice(c.sma50), sma200 = slice(c.sma200);
-  const traces = [{x:dates,y:close,type:'scatter',mode:'lines',name:'Close',line:{color:'#2dd4bf',width:2.4}}];
-  if(prefs.ma){ traces.push({x:dates,y:sma50,type:'scatter',mode:'lines',name:'50DMA',line:{color:'#60a5fa'}},{x:dates,y:sma200,type:'scatter',mode:'lines',name:'200DMA',line:{color:'#f59e0b'}}); }
+  const traces = [{x:dates,y:close,type:'scatter',mode:'lines',name:'Close',line:{color:'#2dd4bf',width:2.4},hovertemplate:'%{x}<br>Close: $%{y:.2f}<extra></extra>'}];
+  if(prefs.ma){
+    traces.push(
+      {x:dates,y:sma50,type:'scatter',mode:'lines',name:'50DMA',line:{color:'#60a5fa'},hovertemplate:'%{x}<br>50DMA: $%{y:.2f}<extra></extra>'},
+      {x:dates,y:sma200,type:'scatter',mode:'lines',name:'200DMA',line:{color:'#f59e0b'},hovertemplate:'%{x}<br>200DMA: $%{y:.2f}<extra></extra>'}
+    );
+  }
   const regime = current.markov.regimeSeries.filter(r=>dates.includes(r.date));
-  stateNames.forEach((s,id)=>{ const pts=regime.filter(r=>r.stateId===id); traces.push({x:pts.map(p=>p.date),y:pts.map(p=>p.close),type:'scatter',mode:'markers',name:`Markov ${s}`,marker:{color:stateColor[s],size:6,symbol:'square'}}); });
+  stateNames.forEach((s,id)=>{
+    const pts=regime.filter(r=>r.stateId===id);
+    traces.push({
+      x:pts.map(p=>p.date),
+      y:pts.map(p=>p.close),
+      type:'scatter',
+      mode:'markers',
+      name:`Markov ${s}`,
+      marker:{color:stateColor[s],size:4,symbol:'circle',opacity:0.7},
+      hovertemplate:'%{x}<br>Price: $%{y:.2f}<br>State: ' + s + '<extra></extra>'
+    });
+  });
   const yMin = Math.min(...close.filter(x=>x)), yMax = Math.max(...close.filter(x=>x));
   const layout = darkLayout(`${current.ticker} Final Price Workbench: Transcript Trend + Markov States + Shock Windows`,'Price');
   layout.shapes = eventShapes(dates,yMin,yMax);

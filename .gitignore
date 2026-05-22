@@ -8,3 +8,6 @@ dashboard_data/
 trading_strategy_dashboard.html
 transcript_extracted.txt
 *.tmp
+.env
+watchlist.json
+

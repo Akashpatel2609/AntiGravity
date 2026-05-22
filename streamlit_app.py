@@ -16,8 +16,8 @@ from analyst_dashboard_app import (
 
 
 st.set_page_config(
-    page_title="AntiGravity Stock Research",
-    page_icon="AG",
+    page_title="Trade Researcher Bot",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -180,8 +180,8 @@ def price_fusion_chart(
         col=1,
     )
     if show_ma:
-        fig.add_trace(go.Scatter(x=dates, y=chart["sma50"][-n:], mode="lines", name="50DMA", line=dict(color="#60a5fa")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=dates, y=chart["sma200"][-n:], mode="lines", name="200DMA", line=dict(color="#f59e0b")), row=1, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=chart["sma50"][-n:], mode="lines", name="50DMA", line=dict(color="#60a5fa"), hovertemplate="Date: %{x}<br>50DMA: $%{y:.2f}<extra></extra>"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=dates, y=chart["sma200"][-n:], mode="lines", name="200DMA", line=dict(color="#f59e0b"), hovertemplate="Date: %{x}<br>200DMA: $%{y:.2f}<extra></extra>"), row=1, col=1)
     state_colors = {"Bear": "#fb7185", "Sideways": "#f59e0b", "Bull": "#34d399"}
     regime = [r for r in markov["regimeSeries"] if r["date"] in set(dates)]
     for state in ("Bear", "Sideways", "Bull"):
@@ -192,7 +192,8 @@ def price_fusion_chart(
                 y=[p["close"] for p in pts],
                 mode="markers",
                 name=f"Markov {state}",
-                marker=dict(color=state_colors[state], size=6, symbol="square"),
+                marker=dict(color=state_colors[state], size=4, symbol="circle", opacity=0.7),
+                hovertemplate="Date: %{x}<br>Price: $%{y:.2f}<br>Regime: " + state + "<extra></extra>"
             ),
             row=1,
             col=1,
@@ -201,12 +202,12 @@ def price_fusion_chart(
         "#34d399" if (chart["close"][-n:][i] or 0) >= (chart["open"][-n:][i] or 0) else "#fb7185"
         for i in range(len(dates))
     ]
-    fig.add_trace(go.Bar(x=dates, y=chart["volume"][-n:], name="Volume", marker_color=volume_colors), row=2, col=1)
-    fig.add_trace(go.Scatter(x=dates, y=chart["rsi"][-n:], mode="lines", name="RSI 14", line=dict(color="#a78bfa")), row=3, col=1)
+    fig.add_trace(go.Bar(x=dates, y=chart["volume"][-n:], name="Volume", marker_color=volume_colors, hovertemplate="Date: %{x}<br>Volume: %{y}<extra></extra>"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=chart["rsi"][-n:], mode="lines", name="RSI 14", line=dict(color="#a78bfa"), hovertemplate="Date: %{x}<br>RSI 14: %{y:.2f}<extra></extra>"), row=3, col=1)
     fig.add_hrect(y0=70, y1=100, fillcolor="rgba(251,113,133,.12)", line_width=0, row=3, col=1)
     fig.add_hrect(y0=0, y1=30, fillcolor="rgba(52,211,153,.10)", line_width=0, row=3, col=1)
     fig.add_trace(
-        go.Scatter(x=dates, y=[x * 100 if x is not None else None for x in chart["drawdown"][-n:]], mode="lines", name="Drawdown", line=dict(color="#f97316")),
+        go.Scatter(x=dates, y=[x * 100 if x is not None else None for x in chart["drawdown"][-n:]], mode="lines", name="Drawdown", line=dict(color="#f97316"), hovertemplate="Date: %{x}<br>Drawdown: %{y:.2f}%<extra></extra>"),
         row=4,
         col=1,
     )
@@ -284,9 +285,60 @@ def cached_markov(ticker: str, years: int, window: int, threshold: float, hmm: b
     return run_markov_model(ticker, years=years, window=window, threshold=threshold, include_hmm=hmm)
 
 
-st.sidebar.title("AntiGravity")
-page = st.sidebar.radio("Page", ["Final Verdict", "Markov Model", "Cycle Cheatsheet"])
-ticker = st.sidebar.text_input("Ticker", "SPY").strip().upper() or "SPY"
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_watchlist_item(ticker: str, years: int, window: int, threshold: float) -> dict:
+    return build_fusion_payload(ticker, years=years, window=window, threshold=threshold, include_hmm=False)
+def get_forecast_state_prob(curr_state_id: int, forecast_matrix: list[list[float]]) -> tuple[str, float]:
+    probs = forecast_matrix[curr_state_id]
+    max_val = max(probs)
+    max_idx = probs.index(max_val)
+    states = ["Bear", "Sideways", "Bull"]
+    return states[max_idx], max_val * 100
+
+
+def load_watchlist() -> list[str]:
+    import json
+    filepath = "watchlist.json"
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return [str(x).upper() for x in data]
+        except Exception:
+            pass
+    return ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA"]
+
+
+def save_watchlist(watchlist: list[str]) -> None:
+    import json
+    filepath = "watchlist.json"
+    try:
+        with open(filepath, "w") as f:
+            json.dump(list(dict.fromkeys(watchlist)), f)
+    except Exception:
+        pass
+
+
+# Query parameters for ticker and page selection
+url_ticker = st.query_params.get("ticker", "SPY").strip().upper()
+url_page = st.query_params.get("page", "Final Verdict")
+
+st.sidebar.title("Trade Researcher Bot")
+
+# Set session state defaults from URL query parameters
+if "page_radio" not in st.session_state:
+    st.session_state["page_radio"] = url_page
+if "ticker_input" not in st.session_state:
+    st.session_state["ticker_input"] = url_ticker
+
+page = st.sidebar.radio("Page", ["Final Verdict", "Markov Model", "Watchlist Matrix", "Cycle Cheatsheet"], key="page_radio")
+ticker = st.sidebar.text_input("Ticker", key="ticker_input").strip().upper() or "SPY"
+
+# Keep query params in sync
+st.query_params["ticker"] = ticker
+st.query_params["page"] = page
+
 years = st.sidebar.slider("History years", 1, 30, 30)
 window = st.sidebar.slider("Markov rolling window", 5, 252, 20)
 threshold = st.sidebar.slider("Regime threshold", 0.001, 0.25, 0.02, 0.001)
@@ -299,8 +351,8 @@ window_label = st.sidebar.selectbox("Chart window", ["3M", "6M", "1Y", "2Y", "5Y
 if auto_refresh:
     components.html("<script>setTimeout(() => window.parent.location.reload(), 300000)</script>", height=0)
 
-st.title("AntiGravity Stock Research Dashboard")
-st.caption("Transcript cycle model + Markov regimes + macro/sentiment + shock-event robustness.")
+st.title("Trade Researcher Bot Dashboard")
+st.caption("Transcript cycle model + Markov regimes + news/social sentiment + shock-event robustness.")
 
 if page == "Final Verdict":
     with st.spinner("Running combined dashboard..."):
@@ -311,16 +363,22 @@ if page == "Final Verdict":
     markov = data["markov"]
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Ticker", data["ticker"], data["updated"])
-    c2.metric("Live price", f"${transcript['price']}", transcript["liveQuote"].get("source", ""))
-    c3.metric("Final score", f"{final['score']}/100", final["verdict"])
-    c4.metric("Transcript phase", transcript["phaseModel"]["current"].replace(" - ", " | "))
-    c5.metric("Markov state", markov["currentState"], f"Sharpe {fmt_number(markov['walkForward'].get('sharpe'))}")
+    c1.metric("Ticker", data["ticker"])
+    daily_change = transcript.get("dailyChange")
+    price_delta = f"{daily_change:+.2f}%" if daily_change is not None else None
+    c2.metric("Live price", f"${transcript['price']:.2f}", price_delta)
+    c3.metric("Final score", f"{final['score']}/100")
+    phase_current = transcript["phaseModel"]["current"]
+    phase_short = phase_current.split(" - ")[0]
+    c4.metric("Transcript phase", phase_short)
+    c5.metric("Markov state", markov["currentState"])
     st.caption(
         f"Historical range: {markov['start']} to {markov['end']} | "
         f"{markov['rows']:,} daily bars | "
+        f"Walk-forward Sharpe: {fmt_number(markov['walkForward'].get('sharpe'))} | "
         f"Quote source: {transcript['liveQuote'].get('source', 'yfinance fallback')} | "
-        f"Quote time: {transcript['liveQuote'].get('timestamp') or 'latest daily close'}"
+        f"Quote time: {transcript['liveQuote'].get('timestamp') or 'latest daily close'} | "
+        f"Last updated: {data['updated']}"
     )
 
     left, right = st.columns([1.35, 0.85])
@@ -332,6 +390,22 @@ if page == "Final Verdict":
         st.markdown("### Evidence")
         for item in final["evidence"]:
             st.write(f"- {item}")
+        
+        st.markdown("### Live Sentiment & Social Buzz")
+        sentiment = transcript.get("sentiment", {})
+        lbl = sentiment.get("label", "Neutral")
+        score_val = sentiment.get("score", 0)
+        st.write(f"Consolidated Sentiment: **{lbl}** (Score: {score_val:+.1f})")
+        st.write(f"- News Sentiment: {sentiment.get('news_score', 0):+.1f}")
+        st.write(f"- Reddit Sentiment: {sentiment.get('reddit_score', 0):+.1f}")
+        
+        with st.expander("Show Sentiment Feed Detail"):
+            items = sentiment.get("items", [])
+            if items:
+                for item in items[:10]:
+                    st.markdown(f"- **{item['publisher']}**: [{item['title']}]({item['link']}) ({item.get('type', 'news')})")
+            else:
+                st.write("No news or social buzz found.")
 
     st.markdown("### Phase Quadrants")
     phase_cols = st.columns(3)
@@ -384,10 +458,16 @@ elif page == "Markov Model":
         markov = cached_markov(ticker, years, window, threshold, include_hmm)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Ticker", markov["ticker"], f"{markov['rows']} rows")
+    c1.metric("Ticker", markov["ticker"])
     c2.metric("Current regime", markov["currentState"])
     c3.metric("Walk-forward Sharpe", fmt_number(markov["walkForward"].get("sharpe")))
     c4.metric("Max drawdown", fmt_percent(markov["walkForward"].get("maxDrawdown")))
+    st.caption(
+        f"Historical range: {markov['start']} to {markov['end']} | "
+        f"{markov['rows']:,} daily bars | "
+        f"Regime threshold: {threshold} | "
+        f"Rolling window: {window} days"
+    )
 
     st.markdown("### Transition Matrix")
     st.dataframe(matrix_df(markov["matrix"]), use_container_width=True)
@@ -402,6 +482,202 @@ elif page == "Markov Model":
     st.write(markov["hmm"]["message"])
     if markov["hmm"].get("states"):
         st.dataframe(pd.DataFrame(markov["hmm"]["states"]), use_container_width=True)
+
+elif page == "Watchlist Matrix":
+    st.subheader("Personal Watchlist Matrix")
+    st.caption("A multi-horizon forecasting matrix of your watchlist stocks. Click on a ticker to load its detailed charts and metrics.")
+
+    # Search & Add Stock
+    col_search, col_btn = st.columns([3, 1])
+    with col_search:
+        new_ticker = st.text_input(
+            "Search and Add Stock",
+            placeholder="Search ticker (e.g. AMD, META, AMZN)...",
+            label_visibility="collapsed",
+            key="watchlist_new_ticker"
+        ).strip().upper()
+    with col_btn:
+        add_clicked = st.button("➕ Add Stock", use_container_width=True)
+
+    if add_clicked and new_ticker:
+        from analyst_dashboard_app import clean_ticker
+        cleaned_tk = clean_ticker(new_ticker)
+        watchlist = load_watchlist()
+        if cleaned_tk in watchlist:
+            st.warning(f"Ticker {cleaned_tk} is already in your watchlist.")
+        else:
+            with st.spinner(f"Verifying {cleaned_tk}..."):
+                try:
+                    import yfinance as yf
+                    check_df = yf.download(cleaned_tk, period="5d", progress=False, threads=False)
+                    if not check_df.empty:
+                        watchlist.append(cleaned_tk)
+                        save_watchlist(watchlist)
+                        st.success(f"Added {cleaned_tk} to your watchlist!")
+                        st.rerun()
+                    else:
+                        st.error(f"No price data found for {cleaned_tk}. Verify the symbol is correct.")
+                except Exception as e:
+                    st.error(f"Could not verify {cleaned_tk}: {e}")
+
+    # Load and render watchlist
+    watchlist = load_watchlist()
+    if not watchlist:
+        st.info("Your watchlist is empty. Search and add tickers above.")
+    else:
+        # Show progress
+        watchlist_data = []
+        progress_text = "Fetching watchlist metrics..."
+        my_bar = st.progress(0, text=progress_text)
+        for idx, tk in enumerate(watchlist):
+            my_bar.progress((idx + 1) / len(watchlist), text=f"Processing {tk} ({idx+1}/{len(watchlist)})...")
+            try:
+                # Use include_hmm=False to keep it quick
+                data = cached_watchlist_item(tk, years, window, threshold)
+                watchlist_data.append(data)
+            except Exception as e:
+                st.error(f"Error fetching data for {tk}: {e}")
+        my_bar.empty()
+
+        # Build forecasts table
+        if watchlist_data:
+            st.markdown(
+                """
+                <style>
+                .badge-buy { background-color: #10221f; color: #2dd4bf; border: 1px solid #2dd4bf; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.85em; }
+                .badge-accumulate { background-color: #1a231f; color: #34d399; border: 1px solid #34d399; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.85em; }
+                .badge-hold { background-color: #221a0f; color: #f59e0b; border: 1px solid #f59e0b; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.85em; }
+                .badge-reduce { background-color: #221414; color: #f97316; border: 1px solid #f97316; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.85em; }
+                .badge-sell { background-color: #251215; color: #fb7185; border: 1px solid #fb7185; border-radius: 4px; padding: 2px 6px; font-weight: bold; font-size: 0.85em; }
+                
+                .state-bull { color: #34d399; font-weight: bold; }
+                .state-sideways { color: #f59e0b; font-weight: bold; }
+                .state-bear { color: #fb7185; font-weight: bold; }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+
+            # Table header
+            t_col1, t_col2, t_col3, t_col4, t_col5, t_col6, t_col7, t_col8, t_col9, t_col10 = st.columns(
+                [1.1, 1.4, 1.6, 1.2, 1.8, 1.4, 1.4, 1.4, 1.4, 0.6]
+            )
+            t_col1.write("**Ticker**")
+            t_col2.write("**Price / Change**")
+            t_col3.write("**Signal**")
+            t_col4.write("**Markov**")
+            t_col5.write("**Cycle Phase**")
+            t_col6.write("**Tomorrow**")
+            t_col7.write("**3 Days**")
+            t_col8.write("**1 Week**")
+            t_col9.write("**1 Month**")
+            t_col10.write("**Del**")
+            st.markdown("<hr style='margin: 4px 0 12px 0; border-color: #303036;'>", unsafe_allow_html=True)
+
+            def get_action_badge(score: float) -> str:
+                if score >= 72:
+                    return '<span class="badge-buy">🟢 BUY</span>'
+                elif score >= 58:
+                    return '<span class="badge-accumulate">🟢 ACCUM</span>'
+                elif score >= 42:
+                    return '<span class="badge-hold">🟡 HOLD</span>'
+                elif score >= 28:
+                    return '<span class="badge-reduce">🟠 REDUCE</span>'
+                else:
+                    return '<span class="badge-sell">🔴 SELL</span>'
+
+            def get_state_span(state: str) -> str:
+                cls_map = {"Bull": "state-bull", "Sideways": "state-sideways", "Bear": "state-bear"}
+                return f'<span class="{cls_map.get(state, "")}">{state}</span>'
+
+            for row in watchlist_data:
+                r_col1, r_col2, r_col3, r_col4, r_col5, r_col6, r_col7, r_col8, r_col9, r_col10 = st.columns(
+                    [1.1, 1.4, 1.6, 1.2, 1.8, 1.4, 1.4, 1.4, 1.4, 0.6]
+                )
+                ticker_symbol = row["ticker"]
+                transcript = row["transcript"]
+                markov = row["markov"]
+                final = row["final"]
+
+                # 1. Ticker button
+                with r_col1:
+                    if st.button(ticker_symbol, key=f"select_{ticker_symbol}", help=f"Show full verdict & charts for {ticker_symbol}"):
+                        st.session_state["ticker_input"] = ticker_symbol
+                        st.session_state["page_radio"] = "Final Verdict"
+                        st.rerun()
+
+                # 2. Price / Daily Change
+                price = transcript["price"]
+                change = transcript["dailyChange"]
+                change_val = change if change is not None else 0.0
+                change_color = "#34d399" if change_val >= 0 else "#fb7185"
+                r_col2.markdown(
+                    f"**${price:.2f}**<br><span style='color:{change_color}; font-size:0.85em;'>{change_val:+.2f}%</span>",
+                    unsafe_allow_html=True
+                )
+
+                # 3. Buy/Sell/Hold Signal
+                score = final["score"]
+                r_col3.markdown(
+                    f"{get_action_badge(score)}<br><span class='muted' style='font-size:0.8em;'>Score: {score}</span>",
+                    unsafe_allow_html=True
+                )
+
+                # 4. Markov State
+                m_state = markov["currentState"]
+                r_col4.markdown(get_state_span(m_state), unsafe_allow_html=True)
+
+                # 5. Cycle Phase
+                c_phase = transcript["phaseModel"]["current"]
+                phase_parts = c_phase.split(" - ")
+                phase_short = phase_parts[0].replace("Bull Stage ", "B").replace("Bear Stage ", "Bear ")
+                phase_detail = phase_parts[1] if len(phase_parts) > 1 else ""
+                r_col5.markdown(
+                    f"<span style='font-size:0.9em; font-weight:500;'>{phase_short}</span><br><span class='muted' style='font-size:0.75em;'>{phase_detail}</span>",
+                    unsafe_allow_html=True
+                )
+
+                # 6. Tomorrow Prediction
+                next_day = max(markov["nextDay"], key=lambda x: x["probability"])
+                tom_state = next_day["state"]
+                tom_prob = next_day["probability"]
+                r_col6.markdown(
+                    f"{get_state_span(tom_state)}<br><span class='muted' style='font-size:0.8em;'>{tom_prob:.0f}%</span>",
+                    unsafe_allow_html=True
+                )
+
+                # 7. 3 Days Prediction
+                f3_state, f3_prob = get_forecast_state_prob(markov["currentStateId"], markov["forecast3"])
+                r_col7.markdown(
+                    f"{get_state_span(f3_state)}<br><span class='muted' style='font-size:0.8em;'>{f3_prob:.0f}%</span>",
+                    unsafe_allow_html=True
+                )
+
+                # 8. 1 Week Prediction
+                f5_state, f5_prob = get_forecast_state_prob(markov["currentStateId"], markov["forecast5"])
+                r_col8.markdown(
+                    f"{get_state_span(f5_state)}<br><span class='muted' style='font-size:0.8em;'>{f5_prob:.0f}%</span>",
+                    unsafe_allow_html=True
+                )
+
+                # 9. 1 Month Prediction
+                f20_state, f20_prob = get_forecast_state_prob(markov["currentStateId"], markov["forecast20"])
+                r_col9.markdown(
+                    f"{get_state_span(f20_state)}<br><span class='muted' style='font-size:0.8em;'>{f20_prob:.0f}%</span>",
+                    unsafe_allow_html=True
+                )
+
+                # 10. Delete Button
+                with r_col10:
+                    if st.button("❌", key=f"del_{ticker_symbol}", help=f"Remove {ticker_symbol} from watchlist"):
+                        watchlist = load_watchlist()
+                        if ticker_symbol in watchlist:
+                            watchlist.remove(ticker_symbol)
+                            save_watchlist(watchlist)
+                            st.success(f"Removed {ticker_symbol}!")
+                            st.rerun()
+                
+                st.markdown("<hr style='margin: 6px 0; border-color: #222225;'>", unsafe_allow_html=True)
 
 else:
     st.markdown(

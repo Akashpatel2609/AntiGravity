@@ -1,6 +1,6 @@
-# AntiGravity
+# Trade Researcher Bot
 
-Local stock research dashboard built with Flask, Plotly, yfinance, Alpaca live data, a transcript-inspired market-cycle model, and an observable Markov regime model.
+Local stock research dashboard built with Streamlit and Flask, featuring Plotly charts, yfinance and Reddit API live data, a transcript-inspired market-cycle model, an observable Markov regime model, and an interactive personal Watchlist Matrix.
 
 ## Hosted dashboard
 
