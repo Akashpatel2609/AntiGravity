@@ -286,8 +286,8 @@ def cached_markov(ticker: str, years: int, window: int, threshold: float, hmm: b
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_watchlist_item(ticker: str, years: int, window: int, threshold: float) -> dict:
-    return build_fusion_payload(ticker, years=years, window=window, threshold=threshold, include_hmm=False)
+def cached_watchlist_item(ticker: str, window: int, threshold: float) -> dict:
+    return build_fusion_payload(ticker, years=2, window=window, threshold=threshold, include_hmm=False)
 def get_forecast_state_prob(curr_state_id: int, forecast_matrix: list[list[float]]) -> tuple[str, float]:
     probs = forecast_matrix[curr_state_id]
     max_val = max(probs)
@@ -296,12 +296,14 @@ def get_forecast_state_prob(curr_state_id: int, forecast_matrix: list[list[float
     return states[max_idx], max_val * 100
 
 
+WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
+
+
 def load_watchlist() -> list[str]:
     import json
-    filepath = "watchlist.json"
-    if os.path.exists(filepath):
+    if os.path.exists(WATCHLIST_FILE):
         try:
-            with open(filepath, "r") as f:
+            with open(WATCHLIST_FILE, "r") as f:
                 data = json.load(f)
                 if isinstance(data, list):
                     return [str(x).upper() for x in data]
@@ -312,9 +314,8 @@ def load_watchlist() -> list[str]:
 
 def save_watchlist(watchlist: list[str]) -> None:
     import json
-    filepath = "watchlist.json"
     try:
-        with open(filepath, "w") as f:
+        with open(WATCHLIST_FILE, "w") as f:
             json.dump(list(dict.fromkeys(watchlist)), f)
     except Exception:
         pass
@@ -487,8 +488,8 @@ elif page == "Watchlist Matrix":
     st.subheader("Personal Watchlist Matrix")
     st.caption("A multi-horizon forecasting matrix of your watchlist stocks. Click on a ticker to load its detailed charts and metrics.")
 
-    # Search & Add Stock
-    col_search, col_btn = st.columns([3, 1])
+    # Search & Add Stock & Refresh
+    col_search, col_add, col_ref = st.columns([3, 1.2, 1.2])
     with col_search:
         new_ticker = st.text_input(
             "Search and Add Stock",
@@ -496,11 +497,17 @@ elif page == "Watchlist Matrix":
             label_visibility="collapsed",
             key="watchlist_new_ticker"
         ).strip().upper()
-    with col_btn:
+    with col_add:
         add_clicked = st.button("➕ Add Stock", use_container_width=True)
+    with col_ref:
+        if st.button("🔄 Refresh Data", use_container_width=True, help="Clear all caching layers and reload fresh data"):
+            from analyst_dashboard_app import clear_backend_cache
+            clear_backend_cache()
+            st.cache_data.clear()
+            st.rerun()
 
     if add_clicked and new_ticker:
-        from analyst_dashboard_app import clean_ticker
+        from analyst_dashboard_app import clean_ticker, _yf_lock
         cleaned_tk = clean_ticker(new_ticker)
         watchlist = load_watchlist()
         if cleaned_tk in watchlist:
@@ -509,7 +516,8 @@ elif page == "Watchlist Matrix":
             with st.spinner(f"Verifying {cleaned_tk}..."):
                 try:
                     import yfinance as yf
-                    check_df = yf.download(cleaned_tk, period="5d", progress=False, threads=False)
+                    with _yf_lock:
+                        check_df = yf.download(cleaned_tk, period="5d", progress=False, threads=False)
                     if not check_df.empty:
                         watchlist.append(cleaned_tk)
                         save_watchlist(watchlist)
@@ -525,19 +533,20 @@ elif page == "Watchlist Matrix":
     if not watchlist:
         st.info("Your watchlist is empty. Search and add tickers above.")
     else:
-        # Show progress
+        import concurrent.futures
         watchlist_data = []
-        progress_text = "Fetching watchlist metrics..."
-        my_bar = st.progress(0, text=progress_text)
-        for idx, tk in enumerate(watchlist):
-            my_bar.progress((idx + 1) / len(watchlist), text=f"Processing {tk} ({idx+1}/{len(watchlist)})...")
-            try:
-                # Use include_hmm=False to keep it quick
-                data = cached_watchlist_item(tk, years, window, threshold)
-                watchlist_data.append(data)
-            except Exception as e:
-                st.error(f"Error fetching data for {tk}: {e}")
-        my_bar.empty()
+        with st.spinner("Fetching watchlist metrics in parallel..."):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(watchlist), 15)) as executor:
+                futures = [
+                    (tk, executor.submit(cached_watchlist_item, tk, window, threshold))
+                    for tk in watchlist
+                ]
+                for tk, future in futures:
+                    try:
+                        data = future.result()
+                        watchlist_data.append(data)
+                    except Exception as e:
+                        st.error(f"Error fetching data for {tk}: {e}")
 
         # Build forecasts table
         if watchlist_data:

@@ -6,6 +6,8 @@ import json
 import re
 import shutil
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +16,38 @@ import pandas as pd
 import requests
 import yfinance as yf
 from flask import Flask, jsonify, render_template_string, request
+
+
+class SimpleMemoryCache:
+    def __init__(self):
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def get(self, key, ttl_seconds):
+        with self._lock:
+            if key in self._cache:
+                val, expiry = self._cache[key]
+                if time.time() < expiry:
+                    return val
+                else:
+                    del self._cache[key]
+            return None
+
+    def set(self, key, value, ttl_seconds):
+        with self._lock:
+            self._cache[key] = (value, time.time() + ttl_seconds)
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+
+
+_global_mem_cache = SimpleMemoryCache()
+_yf_lock = threading.Lock()
+
+
+def clear_backend_cache():
+    _global_mem_cache.clear()
 
 
 ROOT = Path(__file__).resolve().parent
@@ -84,14 +118,20 @@ def clean_ticker(ticker: str) -> str:
 
 
 def download(ticker: str, period: str = "3y") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, auto_adjust=True, progress=False, threads=False)
+    cache_key = f"download:{ticker}:{period}"
+    cached = _global_mem_cache.get(cache_key, 600)
+    if cached is not None:
+        return cached.copy()
+    with _yf_lock:
+        df = yf.download(ticker, period=period, auto_adjust=True, progress=False, threads=False)
     if df.empty:
         raise ValueError(f"No price data found for {ticker}")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna(how="all")
     df.index = pd.to_datetime(df.index).tz_localize(None)
-    return df
+    _global_mem_cache.set(cache_key, df, 600)
+    return df.copy()
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -263,20 +303,18 @@ def markov_fit_hmm(close: pd.Series) -> dict:
 
 
 def run_markov_model(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = True) -> dict:
-    end = pd.Timestamp.utcnow().normalize()
-    start = end - pd.DateOffset(years=years)
-    df = yf.download(
-        ticker,
-        start=start.strftime("%Y-%m-%d"),
-        end=end.strftime("%Y-%m-%d"),
-        progress=False,
-        auto_adjust=True,
-        threads=False,
-    )
-    if df.empty:
-        raise ValueError(f"Yahoo Finance returned no data for {ticker}. Try again later or use another ticker.")
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    cache_key = f"markov_model:{ticker}:{years}:{window}:{threshold}:{include_hmm}"
+    cached = _global_mem_cache.get(cache_key, 300)
+    if cached is not None:
+        return cached
+    res = _run_markov_model_uncached(ticker, years, window, threshold, include_hmm)
+    _global_mem_cache.set(cache_key, res, 300)
+    return res
+
+
+def _run_markov_model_uncached(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = True) -> dict:
+    history_period = f"{max(1, int(years))}y"
+    df = download(ticker, history_period)
     close = df["Close"].dropna()
     labels = markov_label_regimes(close, window=window, threshold=threshold)
     P = markov_transition_matrix(labels)
@@ -434,6 +472,16 @@ def fusion_verdict(transcript: dict, markov: dict) -> dict:
 
 
 def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = True) -> dict:
+    cache_key = f"fusion_payload:{ticker}:{years}:{window}:{threshold}:{include_hmm}"
+    cached = _global_mem_cache.get(cache_key, 300)
+    if cached is not None:
+        return cached
+    res = _build_fusion_payload_uncached(ticker, years, window, threshold, include_hmm)
+    _global_mem_cache.set(cache_key, res, 300)
+    return res
+
+
+def _build_fusion_payload_uncached(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = True) -> dict:
     history_period = f"{max(1, int(years))}y"
     price = add_indicators(download(ticker, history_period))
     spy = add_indicators(download("SPY", history_period))
@@ -475,8 +523,13 @@ def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, thresho
 
 
 def get_news_sentiment(ticker: str):
+    cache_key = f"news_sentiment:{ticker}"
+    cached = _global_mem_cache.get(cache_key, 1800)
+    if cached is not None:
+        return cached
     try:
-        news = yf.Ticker(ticker).news or []
+        with _yf_lock:
+            news = yf.Ticker(ticker).news or []
     except Exception:
         news = []
     rows = []
@@ -497,10 +550,16 @@ def get_news_sentiment(ticker: str):
         label = "Positive"
     elif total <= -2:
         label = "Negative"
-    return {"label": label, "score": total, "items": rows}
+    result = {"label": label, "score": total, "items": rows}
+    _global_mem_cache.set(cache_key, result, 1800)
+    return result
 
 
 def get_reddit_sentiment(ticker: str) -> dict:
+    cache_key = f"reddit_sentiment:{ticker}"
+    cached = _global_mem_cache.get(cache_key, 1800)
+    if cached is not None:
+        return cached
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     url = f"https://www.reddit.com/r/stocks+wallstreetbets+investing/search.json?q={ticker}&restrict_sr=1&sort=new&limit=15"
     try:
@@ -536,10 +595,14 @@ def get_reddit_sentiment(ticker: str) -> dict:
                 label = "Positive"
             elif total <= -2:
                 label = "Negative"
-            return {"label": label, "score": total, "items": rows}
+            result = {"label": label, "score": total, "items": rows}
+            _global_mem_cache.set(cache_key, result, 1800)
+            return result
     except Exception:
         pass
-    return {"label": "Neutral", "score": 0, "items": []}
+    fallback_res = {"label": "Neutral", "score": 0, "items": []}
+    _global_mem_cache.set(cache_key, fallback_res, 300)  # Cache failure for 5 mins to avoid spamming
+    return fallback_res
 
 
 def get_consolidated_sentiment(ticker: str) -> dict:
@@ -672,7 +735,12 @@ def indicator_verdict(latest: pd.Series, market_row: pd.Series | None, rel_6m: f
 
 
 def market_context():
-    data = yf.download(["SPY", "QQQ", "^VIX", "TLT", "UUP", "USO"], period="1y", auto_adjust=True, progress=False, threads=False)
+    cache_key = "market_context"
+    cached = _global_mem_cache.get(cache_key, 600)
+    if cached is not None:
+        return cached
+    with _yf_lock:
+        data = yf.download(["SPY", "QQQ", "^VIX", "TLT", "UUP", "USO"], period="1y", auto_adjust=True, progress=False, threads=False)
     close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
     spy = add_indicators(close[["SPY"]].rename(columns={"SPY": "Close"}).assign(Volume=0))
     last = spy.iloc[-1]
@@ -685,6 +753,7 @@ def market_context():
         "oil_1m": pct(close["USO"].pct_change(21).iloc[-1]),
         "spy_above_200": bool(last["Close"] > last["SMA200"]),
     }
+    _global_mem_cache.set(cache_key, ctx, 600)
     return ctx
 
 
@@ -788,6 +857,16 @@ def alpaca_cli_quote_once(ticker: str) -> dict | None:
 
 
 def alpaca_latest_quote(ticker: str) -> dict:
+    cache_key = f"latest_quote:{ticker}"
+    cached_live = _global_mem_cache.get(cache_key, 30)
+    if cached_live is not None:
+        return cached_live
+    res = _alpaca_latest_quote_uncached(ticker)
+    _global_mem_cache.set(cache_key, res, 30)
+    return res
+
+
+def _alpaca_latest_quote_uncached(ticker: str) -> dict:
     cached = alpaca_cli_cached_quote(ticker)
     if cached and not cached.get("error"):
         return cached
@@ -797,9 +876,11 @@ def alpaca_latest_quote(ticker: str) -> dict:
     headers = alpaca_headers()
     if not headers:
         try:
-            raw_info = yf.Ticker(ticker).fast_info
-            last_price = raw_info.get("last_price")
-            prev_close = raw_info.get("previous_close")
+            with _yf_lock:
+                raw_info = yf.Ticker(ticker).fast_info
+                last_price = raw_info.get("last_price")
+                prev_close = raw_info.get("previous_close")
+                last_volume = raw_info.get("last_volume", 0)
             if last_price is not None:
                 return {
                     "enabled": True,
@@ -812,7 +893,7 @@ def alpaca_latest_quote(ticker: str) -> dict:
                     "bidSize": None,
                     "askSize": None,
                     "prevClose": float(prev_close) if prev_close else None,
-                    "volume": float(raw_info.get("last_volume", 0)),
+                    "volume": float(last_volume),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
         except Exception as exc:
@@ -856,9 +937,11 @@ def alpaca_latest_quote(ticker: str) -> dict:
         }
     except Exception as exc:
         try:
-            raw_info = yf.Ticker(ticker).fast_info
-            last_price = raw_info.get("last_price")
-            prev_close = raw_info.get("previous_close")
+            with _yf_lock:
+                raw_info = yf.Ticker(ticker).fast_info
+                last_price = raw_info.get("last_price")
+                prev_close = raw_info.get("previous_close")
+                last_volume = raw_info.get("last_volume", 0)
             if last_price is not None:
                 return {
                     "enabled": True,
@@ -871,7 +954,7 @@ def alpaca_latest_quote(ticker: str) -> dict:
                     "bidSize": None,
                     "askSize": None,
                     "prevClose": float(prev_close) if prev_close else None,
-                    "volume": float(raw_info.get("last_volume", 0)),
+                    "volume": float(last_volume),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
         except Exception:
@@ -1033,8 +1116,9 @@ def analyze():
     phase_model = cycle_phase_model(score, sentiment["news_score"], market, latest, checks, catalysts)
     info = {}
     try:
-        raw_info = yf.Ticker(ticker).fast_info
-        info = {k: raw_info.get(k) for k in ["market_cap", "last_price", "year_high", "year_low"]}
+        with _yf_lock:
+            raw_info = yf.Ticker(ticker).fast_info
+            info = {k: raw_info.get(k) for k in ["market_cap", "last_price", "year_high", "year_low"]}
     except Exception:
         info = {}
     response = {
