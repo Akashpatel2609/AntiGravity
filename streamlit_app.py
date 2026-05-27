@@ -227,23 +227,92 @@ def lightweight_chart(chart: dict, live_price: float | None, interval_label: str
 
 
 st.sidebar.title("Trade Researcher Bot")
-universe = st.sidebar.selectbox("Market", list(ASSET_PRESETS.keys()))
-preset_label = st.sidebar.selectbox("Asset", ["Custom"] + list(ASSET_PRESETS[universe].keys()))
+
+def query_value(name: str, default: str) -> str:
+    try:
+        return str(st.query_params.get(name, default))
+    except Exception:
+        return default
+
+
+def query_int(name: str, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(query_value(name, str(default)))))
+    except Exception:
+        return default
+
+
+def query_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        return max(low, min(high, float(query_value(name, str(default)))))
+    except Exception:
+        return default
+
+
+market_options = list(ASSET_PRESETS.keys())
+saved_universe = query_value("market", "US Stocks / ETFs")
+universe = st.sidebar.selectbox(
+    "Market",
+    market_options,
+    index=market_options.index(saved_universe) if saved_universe in market_options else 0,
+    key="market_filter",
+)
+
+asset_options = ["Custom"] + list(ASSET_PRESETS[universe].keys())
+saved_asset = query_value("asset", "S&P 500 ETF")
+preset_label = st.sidebar.selectbox(
+    "Asset",
+    asset_options,
+    index=asset_options.index(saved_asset) if saved_asset in asset_options else 0,
+    key="asset_filter",
+)
 default_symbol = ASSET_PRESETS[universe].get(preset_label, "SPY")
-ticker_input = st.sidebar.text_input("Ticker", default_symbol, help="Canada examples: RY.TO, TD.TO. In Canada mode, typing RY becomes RY.TO.")
+ticker_input = st.sidebar.text_input(
+    "Ticker",
+    query_value("ticker", default_symbol),
+    help="Canada examples: RY.TO, TD.TO. In Canada mode, typing RY becomes RY.TO.",
+    key="ticker_filter",
+)
 ticker = normalize_symbol(default_symbol if preset_label != "Custom" else ticker_input, universe)
 
-interval_label = st.sidebar.radio("Interval", list(INTERVALS.keys()), index=4, horizontal=True)
-years = st.sidebar.slider("Verdict history", 1, 10, 2, help="Lower history is much faster. Use longer only when researching, not live monitoring.")
-window = st.sidebar.slider("Regime window", 5, 80, 20)
-threshold = st.sidebar.slider("Regime threshold", 0.001, 0.08, 0.02, 0.001)
-refresh_seconds = st.sidebar.selectbox("Auto-refresh", [5, 10, 15, 30, 60], index=2)
+interval_options = list(INTERVALS.keys())
+saved_interval = query_value("interval", "1D")
+interval_label = st.sidebar.radio(
+    "Interval",
+    interval_options,
+    index=interval_options.index(saved_interval) if saved_interval in interval_options else 4,
+    horizontal=True,
+    key="interval_filter",
+)
+years = st.sidebar.slider(
+    "Verdict history",
+    1,
+    10,
+    query_int("years", 10, 1, 10),
+    help="History window used by the final verdict engine.",
+    key="years_filter",
+)
+window = st.sidebar.slider("Regime window", 5, 80, query_int("window", 20, 5, 80), key="window_filter")
+threshold = st.sidebar.slider(
+    "Regime threshold",
+    0.001,
+    0.5,
+    query_float("threshold", 0.5, 0.001, 0.5),
+    0.001,
+    key="threshold_filter",
+)
 
 if st.sidebar.button("Refresh now", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-components.html(f"<script>setTimeout(() => window.parent.location.reload(), {refresh_seconds * 1000})</script>", height=0)
+st.query_params["market"] = universe
+st.query_params["asset"] = preset_label
+st.query_params["ticker"] = ticker_input
+st.query_params["interval"] = interval_label
+st.query_params["years"] = str(years)
+st.query_params["window"] = str(window)
+st.query_params["threshold"] = str(threshold)
 
 start = time.perf_counter()
 with st.spinner("Refreshing live verdict..."):
