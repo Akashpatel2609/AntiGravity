@@ -321,16 +321,33 @@ def _run_markov_model_uncached(ticker: str, years: int = 10, window: int = 20, t
     return run_markov_from_close(ticker, close, years, window, threshold, include_hmm)
 
 
-def run_markov_from_close(ticker: str, close: pd.Series, years: int, window: int, threshold: float, include_hmm: bool) -> dict:
+def run_markov_from_close(
+    ticker: str,
+    close: pd.Series,
+    years: int,
+    window: int,
+    threshold: float,
+    include_hmm: bool,
+    fast: bool = False,
+) -> dict:
     labels = markov_label_regimes(close, window=window, threshold=threshold)
     P = markov_transition_matrix(labels)
     stationary = markov_stationary_distribution(P)
     forecast_3 = np.linalg.matrix_power(P, 3)
     forecast_5 = np.linalg.matrix_power(P, 5)
     forecast_20 = np.linalg.matrix_power(P, 20)
-    walk = markov_walk_forward(close, labels)
     events = event_windows_for_index(close.index)
-    event_adjusted = event_adjusted_walkforward(walk, events)
+    if fast:
+        walk = {"sharpe": None, "maxDrawdown": None, "trades": 0, "equity": [], "dates": [], "returns": []}
+        event_adjusted = {
+            "shockTrades": 0,
+            "cleanTrades": 0,
+            "cleanSharpe": None,
+            "note": "Fast mode skips the heavy walk-forward backtest for live dashboard refresh speed.",
+        }
+    else:
+        walk = markov_walk_forward(close, labels)
+        event_adjusted = event_adjusted_walkforward(walk, events)
     current_state_id = int(labels.iloc[-1])
     current_state = MARKOV_STATES[current_state_id]
     next_probs = P[current_state_id]
@@ -477,25 +494,39 @@ def fusion_verdict(transcript: dict, markov: dict) -> dict:
     return {"score": round(score, 1), "verdict": verdict, "action": action, "evidence": evidence}
 
 
-def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = False) -> dict:
-    cache_key = f"fusion_payload:{ticker}:{years}:{window}:{threshold}:{include_hmm}"
-    cached = _global_mem_cache.get(cache_key, 300)
+def build_fusion_payload(
+    ticker: str,
+    years: int = 10,
+    window: int = 20,
+    threshold: float = 0.02,
+    include_hmm: bool = False,
+    fast: bool = True,
+) -> dict:
+    cache_key = f"fusion_payload:{ticker}:{years}:{window}:{threshold}:{include_hmm}:{fast}"
+    cached = _global_mem_cache.get(cache_key, 60 if fast else 300)
     if cached is not None:
         return cached
-    res = _build_fusion_payload_uncached(ticker, years, window, threshold, include_hmm)
-    _global_mem_cache.set(cache_key, res, 300)
+    res = _build_fusion_payload_uncached(ticker, years, window, threshold, include_hmm, fast)
+    _global_mem_cache.set(cache_key, res, 60 if fast else 300)
     return res
 
 
-def _build_fusion_payload_uncached(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = False) -> dict:
+def _build_fusion_payload_uncached(
+    ticker: str,
+    years: int = 10,
+    window: int = 20,
+    threshold: float = 0.02,
+    include_hmm: bool = False,
+    fast: bool = True,
+) -> dict:
     history_period = f"{max(1, int(years))}y"
     price = add_indicators(download(ticker, history_period))
-    spy = add_indicators(download("SPY", history_period))
+    spy = price if ticker == "SPY" else add_indicators(download("SPY", history_period))
     market = market_context()
     latest = price.iloc[-1]
     prev = price.iloc[-2]
     rel_6m = safe_float(latest.get("RET_6M")) - safe_float(spy.iloc[-1].get("RET_6M"), 0)
-    sentiment = get_consolidated_sentiment(ticker)
+    sentiment = cached_or_neutral_sentiment(ticker) if fast else get_consolidated_sentiment(ticker)
     catalysts = catalyst_tags(sentiment["items"])
     live_quote = alpaca_latest_quote(ticker)
     display_price = live_quote.get("last") or live_quote.get("mid") or safe_float(latest["Close"])
@@ -517,7 +548,15 @@ def _build_fusion_payload_uncached(ticker: str, years: int = 10, window: int = 2
         "chart": chart_payload(price, ticker),
         "liveQuote": live_quote,
     }
-    markov = run_markov_from_close(ticker, price["Close"].dropna(), years=years, window=window, threshold=threshold, include_hmm=include_hmm)
+    markov = run_markov_from_close(
+        ticker,
+        price["Close"].dropna(),
+        years=years,
+        window=window,
+        threshold=threshold,
+        include_hmm=include_hmm,
+        fast=fast,
+    )
     final = fusion_verdict(transcript, markov)
     return {
         "ticker": ticker,
@@ -612,6 +651,10 @@ def get_reddit_sentiment(ticker: str) -> dict:
 
 
 def get_consolidated_sentiment(ticker: str) -> dict:
+    cache_key = f"consolidated_sentiment:{ticker}"
+    cached = _global_mem_cache.get(cache_key, 1800)
+    if cached is not None:
+        return cached
     news = get_news_sentiment(ticker)
     reddit = get_reddit_sentiment(ticker)
     
@@ -642,13 +685,22 @@ def get_consolidated_sentiment(ticker: str) -> dict:
     elif combined_score <= -3:
         label = "Negative"
         
-    return {
+    result = {
         "label": label,
         "score": combined_score,
         "news_score": news["score"],
         "reddit_score": reddit["score"],
         "items": combined_items
     }
+    _global_mem_cache.set(cache_key, result, 1800)
+    return result
+
+
+def cached_or_neutral_sentiment(ticker: str) -> dict:
+    cached = _global_mem_cache.get(f"consolidated_sentiment:{ticker}", 1800)
+    if cached is not None:
+        return cached
+    return {"label": "Neutral", "score": 0, "news_score": 0, "reddit_score": 0, "items": []}
 
 
 def catalyst_tags(news_items: list[dict]) -> list[dict]:
@@ -1234,10 +1286,11 @@ def fusion_api():
     window = int(request.args.get("window", 20))
     threshold = float(request.args.get("threshold", 0.02))
     include_hmm = request.args.get("hmm", "false").lower() == "true"
+    fast = request.args.get("fast", "true").lower() != "false"
     years = max(1, min(years, 30))
     window = max(5, min(window, 252))
     threshold = max(0.001, min(threshold, 0.25))
-    return jsonify(build_fusion_payload(ticker, years, window, threshold, include_hmm=include_hmm))
+    return jsonify(build_fusion_payload(ticker, years, window, threshold, include_hmm=include_hmm, fast=fast))
 
 
 @app.get("/")
