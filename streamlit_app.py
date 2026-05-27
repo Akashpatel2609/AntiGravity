@@ -112,7 +112,7 @@ def fmt_price(value: float | None) -> str:
     return f"{value:,.2f}"
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def cached_fusion(ticker: str, years: int, window: int, threshold: float) -> dict:
     return build_fusion_payload(
         ticker,
@@ -258,7 +258,7 @@ live_quote = transcript["liveQuote"]
 live_price = live_quote.get("last") or live_quote.get("mid") or transcript.get("price")
 
 st.title("Trade Researcher Bot")
-st.caption("Single-screen fusion verdict with TradingView-style charts. Fast mode skips heavy backtests for live refresh speed.")
+st.caption("Single-screen fusion verdict with TradingView-style charts. The final score uses cycle phase, Markov state/probability, macro, live price, and fresh sentiment.")
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 c1.metric("Ticker", data["ticker"])
@@ -282,8 +282,13 @@ with left:
 with right:
     st.markdown(f"<div class='panel'><div class='verdict'>{final['verdict']}</div><div>{final['action']}</div></div>", unsafe_allow_html=True)
     st.markdown("#### Evidence")
-    for item in final["evidence"][:6]:
+    for item in final["evidence"][:8]:
         st.write(f"- {item}")
+
+    st.markdown("#### Markov Engine")
+    st.write(f"Current state: **{markov['currentState']}**")
+    st.write(f"Fast strategy Sharpe: {fmt_number(markov['walkForward'].get('sharpe'), 3)}")
+    st.write(f"Max drawdown proxy: {fmt_number((markov['walkForward'].get('maxDrawdown') or 0) * 100)}%")
 
     sentiment = transcript.get("sentiment", {})
     st.markdown("#### Sentiment")

@@ -244,6 +244,40 @@ def markov_walk_forward(close: pd.Series, labels: pd.Series, min_train: int = 25
     }
 
 
+def markov_fast_strategy_proxy(close: pd.Series, labels: pd.Series, P: np.ndarray) -> dict:
+    daily_returns = close.pct_change(fill_method=None).dropna()
+    common = labels.index.intersection(daily_returns.index)
+    labels = labels.loc[common]
+    daily_returns = daily_returns.loc[common]
+    if len(labels) < 30:
+        return {"sharpe": None, "maxDrawdown": None, "trades": 0, "equity": [], "dates": [], "returns": []}
+
+    state_ids = labels.to_numpy(dtype=int)
+    signals = P[state_ids, 2] - P[state_ids, 0]
+    positions = np.sign(signals[:-1])
+    next_returns = daily_returns.iloc[1:].to_numpy(dtype=float)
+    strategy_returns = positions * next_returns
+    dates = daily_returns.index[1:].strftime("%Y-%m-%d").tolist()
+
+    sharpe = None
+    if len(strategy_returns) and strategy_returns.std(ddof=1) > 0:
+        sharpe = float(strategy_returns.mean() / strategy_returns.std(ddof=1) * np.sqrt(252))
+    equity = (1.0 + strategy_returns).cumprod()
+    max_dd = None
+    if len(equity):
+        running_max = np.maximum.accumulate(equity)
+        max_dd = float(((equity - running_max) / running_max).min())
+    return {
+        "sharpe": sharpe,
+        "maxDrawdown": max_dd,
+        "trades": int(len(strategy_returns)),
+        "equity": np.round(equity, 4).tolist(),
+        "dates": dates,
+        "returns": np.round(strategy_returns, 8).tolist(),
+        "mode": "fast_proxy",
+    }
+
+
 def event_windows_for_index(index: pd.DatetimeIndex, days: int = 20) -> list[dict]:
     idx_start = index.min()
     idx_end = index.max()
@@ -338,13 +372,9 @@ def run_markov_from_close(
     forecast_20 = np.linalg.matrix_power(P, 20)
     events = event_windows_for_index(close.index)
     if fast:
-        walk = {"sharpe": None, "maxDrawdown": None, "trades": 0, "equity": [], "dates": [], "returns": []}
-        event_adjusted = {
-            "shockTrades": 0,
-            "cleanTrades": 0,
-            "cleanSharpe": None,
-            "note": "Fast mode skips the heavy walk-forward backtest for live dashboard refresh speed.",
-        }
+        walk = markov_fast_strategy_proxy(close, labels, P)
+        event_adjusted = event_adjusted_walkforward(walk, events)
+        event_adjusted["note"] = "Fast mode uses the current transition matrix as a historical strategy proxy for live dashboard speed."
     else:
         walk = markov_walk_forward(close, labels)
         event_adjusted = event_adjusted_walkforward(walk, events)
@@ -503,11 +533,11 @@ def build_fusion_payload(
     fast: bool = True,
 ) -> dict:
     cache_key = f"fusion_payload:{ticker}:{years}:{window}:{threshold}:{include_hmm}:{fast}"
-    cached = _global_mem_cache.get(cache_key, 60 if fast else 300)
+    cached = _global_mem_cache.get(cache_key, 20 if fast else 300)
     if cached is not None:
         return cached
     res = _build_fusion_payload_uncached(ticker, years, window, threshold, include_hmm, fast)
-    _global_mem_cache.set(cache_key, res, 60 if fast else 300)
+    _global_mem_cache.set(cache_key, res, 20 if fast else 300)
     return res
 
 
@@ -526,7 +556,7 @@ def _build_fusion_payload_uncached(
     latest = price.iloc[-1]
     prev = price.iloc[-2]
     rel_6m = safe_float(latest.get("RET_6M")) - safe_float(spy.iloc[-1].get("RET_6M"), 0)
-    sentiment = cached_or_neutral_sentiment(ticker) if fast else get_consolidated_sentiment(ticker)
+    sentiment = get_fast_sentiment(ticker) if fast else get_consolidated_sentiment(ticker)
     catalysts = catalyst_tags(sentiment["items"])
     live_quote = alpaca_latest_quote(ticker)
     display_price = live_quote.get("last") or live_quote.get("mid") or safe_float(latest["Close"])
@@ -696,6 +726,51 @@ def get_consolidated_sentiment(ticker: str) -> dict:
     return result
 
 
+def get_fast_sentiment(ticker: str) -> dict:
+    cache_key = f"fast_sentiment:{ticker}"
+    cached = _global_mem_cache.get(cache_key, 300)
+    if cached is not None:
+        return cached
+
+    news = get_news_sentiment(ticker)
+    reddit = _global_mem_cache.get(f"reddit_sentiment:{ticker}", 1800) or {"label": "Neutral", "score": 0, "items": []}
+    combined_score = news["score"] + reddit["score"]
+    combined_items = []
+    for item in news["items"]:
+        combined_items.append({
+            "title": item["title"],
+            "publisher": item.get("publisher") or "Yahoo Finance",
+            "link": item["link"],
+            "score": item["score"],
+            "published": item["published"],
+            "type": "news",
+        })
+    for item in reddit.get("items", [])[:5]:
+        combined_items.append({
+            "title": item["title"],
+            "publisher": item["publisher"],
+            "link": item["link"],
+            "score": item["score"],
+            "published": item["published"],
+            "type": "reddit_cached",
+        })
+
+    label = "Neutral"
+    if combined_score >= 3:
+        label = "Positive"
+    elif combined_score <= -3:
+        label = "Negative"
+    result = {
+        "label": label,
+        "score": combined_score,
+        "news_score": news["score"],
+        "reddit_score": reddit["score"],
+        "items": combined_items,
+    }
+    _global_mem_cache.set(cache_key, result, 300)
+    return result
+
+
 def cached_or_neutral_sentiment(ticker: str) -> dict:
     cached = _global_mem_cache.get(f"consolidated_sentiment:{ticker}", 1800)
     if cached is not None:
@@ -794,7 +869,7 @@ def indicator_verdict(latest: pd.Series, market_row: pd.Series | None, rel_6m: f
 
 def market_context():
     cache_key = "market_context"
-    cached = _global_mem_cache.get(cache_key, 600)
+    cached = _global_mem_cache.get(cache_key, 60)
     if cached is not None:
         return cached
     with _yf_lock:
@@ -829,7 +904,7 @@ def market_context():
         "silver_1m": last_pct("SLV"),
         "spy_above_200": bool(last["Close"] > last["SMA200"]),
     }
-    _global_mem_cache.set(cache_key, ctx, 600)
+    _global_mem_cache.set(cache_key, ctx, 60)
     return ctx
 
 
