@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -117,6 +118,7 @@ def clean_ticker(ticker: str) -> str:
     return re.sub(r"[^A-Z0-9.\-=^]", "", ticker)[:16] or "NVDA"
 
 
+@lru_cache(maxsize=256)
 def download(ticker: str, period: str = "3y") -> pd.DataFrame:
     cache_key = f"download:{ticker}:{period}"
     cached = _global_mem_cache.get(cache_key, 600)
@@ -153,10 +155,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["BB_UPPER"] = out["BB_MID"] + 2 * close.rolling(20).std()
     out["BB_LOWER"] = out["BB_MID"] - 2 * close.rolling(20).std()
     out["VOL20"] = out["Volume"].rolling(20).mean()
-    out["RET_1M"] = close.pct_change(21)
-    out["RET_3M"] = close.pct_change(63)
-    out["RET_6M"] = close.pct_change(126)
-    out["RET_1Y"] = close.pct_change(252)
+    out["RET_1M"] = close.pct_change(21, fill_method=None)
+    out["RET_3M"] = close.pct_change(63, fill_method=None)
+    out["RET_6M"] = close.pct_change(126, fill_method=None)
+    out["RET_1Y"] = close.pct_change(252, fill_method=None)
     out["DD_1Y"] = close / close.rolling(252).max() - 1
     return out
 
@@ -316,6 +318,10 @@ def _run_markov_model_uncached(ticker: str, years: int = 10, window: int = 20, t
     history_period = f"{max(1, int(years))}y"
     df = download(ticker, history_period)
     close = df["Close"].dropna()
+    return run_markov_from_close(ticker, close, years, window, threshold, include_hmm)
+
+
+def run_markov_from_close(ticker: str, close: pd.Series, years: int, window: int, threshold: float, include_hmm: bool) -> dict:
     labels = markov_label_regimes(close, window=window, threshold=threshold)
     P = markov_transition_matrix(labels)
     stationary = markov_stationary_distribution(P)
@@ -471,7 +477,7 @@ def fusion_verdict(transcript: dict, markov: dict) -> dict:
     return {"score": round(score, 1), "verdict": verdict, "action": action, "evidence": evidence}
 
 
-def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = True) -> dict:
+def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = False) -> dict:
     cache_key = f"fusion_payload:{ticker}:{years}:{window}:{threshold}:{include_hmm}"
     cached = _global_mem_cache.get(cache_key, 300)
     if cached is not None:
@@ -481,7 +487,7 @@ def build_fusion_payload(ticker: str, years: int = 10, window: int = 20, thresho
     return res
 
 
-def _build_fusion_payload_uncached(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = True) -> dict:
+def _build_fusion_payload_uncached(ticker: str, years: int = 10, window: int = 20, threshold: float = 0.02, include_hmm: bool = False) -> dict:
     history_period = f"{max(1, int(years))}y"
     price = add_indicators(download(ticker, history_period))
     spy = add_indicators(download("SPY", history_period))
@@ -511,7 +517,7 @@ def _build_fusion_payload_uncached(ticker: str, years: int = 10, window: int = 2
         "chart": chart_payload(price, ticker),
         "liveQuote": live_quote,
     }
-    markov = run_markov_model(ticker, years=years, window=window, threshold=threshold, include_hmm=include_hmm)
+    markov = run_markov_from_close(ticker, price["Close"].dropna(), years=years, window=window, threshold=threshold, include_hmm=include_hmm)
     final = fusion_verdict(transcript, markov)
     return {
         "ticker": ticker,
@@ -740,17 +746,35 @@ def market_context():
     if cached is not None:
         return cached
     with _yf_lock:
-        data = yf.download(["SPY", "QQQ", "^VIX", "TLT", "UUP", "USO"], period="1y", auto_adjust=True, progress=False, threads=False)
+        data = yf.download(["SPY", "QQQ", "^GSPTSE", "^VIX", "TLT", "UUP", "USO", "GLD", "SLV"], period="1y", auto_adjust=True, progress=False, threads=False)
     close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
     spy = add_indicators(close[["SPY"]].rename(columns={"SPY": "Close"}).assign(Volume=0))
     last = spy.iloc[-1]
+
+    def last_pct(symbol: str, periods: int = 21):
+        if symbol not in close:
+            return None
+        series = close[symbol].dropna()
+        if len(series) <= periods:
+            return None
+        return pct(series.pct_change(periods, fill_method=None).iloc[-1])
+
+    def last_value(symbol: str):
+        if symbol not in close:
+            return None
+        series = close[symbol].dropna()
+        return safe_float(series.iloc[-1]) if len(series) else None
+
     ctx = {
-        "vix": safe_float(close["^VIX"].dropna().iloc[-1]),
-        "spy_1m": pct(close["SPY"].pct_change(21).iloc[-1]),
-        "qqq_1m": pct(close["QQQ"].pct_change(21).iloc[-1]),
-        "tlt_1m": pct(close["TLT"].pct_change(21).iloc[-1]),
-        "dollar_1m": pct(close["UUP"].pct_change(21).iloc[-1]),
-        "oil_1m": pct(close["USO"].pct_change(21).iloc[-1]),
+        "vix": last_value("^VIX"),
+        "spy_1m": last_pct("SPY"),
+        "qqq_1m": last_pct("QQQ"),
+        "tsx_1m": last_pct("^GSPTSE"),
+        "tlt_1m": last_pct("TLT"),
+        "dollar_1m": last_pct("UUP"),
+        "oil_1m": last_pct("USO"),
+        "gold_1m": last_pct("GLD"),
+        "silver_1m": last_pct("SLV"),
         "spy_above_200": bool(last["Close"] > last["SMA200"]),
     }
     _global_mem_cache.set(cache_key, ctx, 600)
@@ -867,6 +891,8 @@ def alpaca_latest_quote(ticker: str) -> dict:
 
 
 def _alpaca_latest_quote_uncached(ticker: str) -> dict:
+    if not alpaca_supported_symbol(ticker):
+        return yfinance_latest_quote(ticker)
     cached = alpaca_cli_cached_quote(ticker)
     if cached and not cached.get("error"):
         return cached
@@ -959,6 +985,28 @@ def _alpaca_latest_quote_uncached(ticker: str) -> dict:
                 }
         except Exception:
             pass
+        return {"enabled": True, "source": "yfinance fallback", "error": str(exc)}
+
+
+def alpaca_supported_symbol(ticker: str) -> bool:
+    return not any(token in ticker for token in (".TO", ".V", ".NE", "=F", "^"))
+
+
+def yfinance_latest_quote(ticker: str) -> dict:
+    try:
+        fast = yf.Ticker(ticker).fast_info
+        last = safe_float(getattr(fast, "last_price", None) or fast.get("last_price"))
+        previous = safe_float(getattr(fast, "previous_close", None) or fast.get("previous_close"))
+        return {
+            "enabled": True,
+            "source": "Yahoo Finance live/delayed quote",
+            "feed": "Yahoo Finance",
+            "last": last,
+            "mid": last,
+            "previousClose": previous,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as exc:
         return {"enabled": True, "source": "yfinance fallback", "error": str(exc)}
 
 
@@ -1185,10 +1233,11 @@ def fusion_api():
     years = int(request.args.get("years", 10))
     window = int(request.args.get("window", 20))
     threshold = float(request.args.get("threshold", 0.02))
+    include_hmm = request.args.get("hmm", "false").lower() == "true"
     years = max(1, min(years, 30))
     window = max(5, min(window, 252))
     threshold = max(0.001, min(threshold, 0.25))
-    return jsonify(build_fusion_payload(ticker, years, window, threshold))
+    return jsonify(build_fusion_payload(ticker, years, window, threshold, include_hmm=include_hmm))
 
 
 @app.get("/")

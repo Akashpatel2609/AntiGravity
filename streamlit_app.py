@@ -15,9 +15,51 @@ from analyst_dashboard_app import (
 )
 
 
+ASSET_PRESETS = {
+    "US Stocks / ETFs": {
+        "S&P 500 ETF": "SPY",
+        "Nasdaq 100 ETF": "QQQ",
+        "Dow ETF": "DIA",
+        "Apple": "AAPL",
+        "Nvidia": "NVDA",
+        "Tesla": "TSLA",
+    },
+    "Canada - TSX": {
+        "TSX Composite Index": "^GSPTSE",
+        "Royal Bank of Canada": "RY.TO",
+        "Toronto-Dominion Bank": "TD.TO",
+        "Shopify": "SHOP.TO",
+        "Enbridge": "ENB.TO",
+        "Canadian Natural Resources": "CNQ.TO",
+        "Suncor Energy": "SU.TO",
+        "Barrick Gold": "ABX.TO",
+    },
+    "Commodities / Macro": {
+        "Gold futures": "GC=F",
+        "Silver futures": "SI=F",
+        "Crude oil futures": "CL=F",
+        "Natural gas futures": "NG=F",
+        "Gold ETF": "GLD",
+        "Silver ETF": "SLV",
+        "Oil ETF": "USO",
+        "US Dollar ETF": "UUP",
+        "20Y Treasury ETF": "TLT",
+    },
+    "Major Indices": {
+        "S&P 500 Index": "^GSPC",
+        "Nasdaq Composite": "^IXIC",
+        "Nasdaq 100": "^NDX",
+        "Dow Jones": "^DJI",
+        "Russell 2000": "^RUT",
+        "VIX": "^VIX",
+        "TSX Composite": "^GSPTSE",
+    },
+}
+
+
 st.set_page_config(
     page_title="Trade Researcher Bot",
-    page_icon="📈",
+    page_icon="TR",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -275,9 +317,16 @@ def fmt_percent(value: float | None, digits: int = 2) -> str:
     return f"{value * 100:.{digits}f}%"
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_fusion(ticker: str, years: int, window: int, threshold: float) -> dict:
-    return build_fusion_payload(ticker, years=years, window=window, threshold=threshold)
+def normalize_symbol(raw: str, universe: str) -> str:
+    symbol = (raw or "").strip().upper()
+    if universe == "Canada - TSX" and symbol and "." not in symbol and not symbol.startswith("^"):
+        return f"{symbol}.TO"
+    return symbol or "SPY"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_fusion(ticker: str, years: int, window: int, threshold: float, include_hmm: bool) -> dict:
+    return build_fusion_payload(ticker, years=years, window=window, threshold=threshold, include_hmm=include_hmm)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -334,7 +383,14 @@ if "ticker_input" not in st.session_state:
     st.session_state["ticker_input"] = url_ticker
 
 page = st.sidebar.radio("Page", ["Final Verdict", "Markov Model", "Watchlist Matrix", "Cycle Cheatsheet"], key="page_radio")
-ticker = st.sidebar.text_input("Ticker", key="ticker_input").strip().upper() or "SPY"
+universe = st.sidebar.selectbox("Market universe", list(ASSET_PRESETS.keys()))
+preset_label = st.sidebar.selectbox("Quick asset", ["Custom"] + list(ASSET_PRESETS[universe].keys()))
+default_symbol = ASSET_PRESETS[universe].get(preset_label, "SPY")
+if preset_label == "Custom":
+    ticker = normalize_symbol(st.sidebar.text_input("Ticker", key="ticker_input"), universe)
+else:
+    ticker = normalize_symbol(default_symbol, universe)
+    st.sidebar.caption(f"Selected symbol: {ticker}")
 
 # Keep query params in sync
 st.query_params["ticker"] = ticker
@@ -346,18 +402,19 @@ threshold = st.sidebar.slider("Regime threshold", 0.001, 0.25, 0.02, 0.001)
 show_events = st.sidebar.toggle("Show shock events", True)
 show_ma = st.sidebar.toggle("Show moving averages", True)
 log_scale = st.sidebar.toggle("Log price scale", False)
-auto_refresh = st.sidebar.toggle("Auto-refresh every 5 minutes", True)
+fast_mode = st.sidebar.toggle("Fast mode", True, help="Skips optional HMM on the main dashboard and reuses downloaded history for faster loads.")
+auto_refresh = st.sidebar.toggle("Auto-refresh every 2 minutes", True)
 window_label = st.sidebar.selectbox("Chart window", ["3M", "6M", "1Y", "2Y", "5Y", "10Y", "20Y", "30Y", "All"], index=8)
 
 if auto_refresh:
-    components.html("<script>setTimeout(() => window.parent.location.reload(), 300000)</script>", height=0)
+    components.html("<script>setTimeout(() => window.parent.location.reload(), 120000)</script>", height=0)
 
 st.title("Trade Researcher Bot Dashboard")
 st.caption("Transcript cycle model + Markov regimes + news/social sentiment + shock-event robustness.")
 
 if page == "Final Verdict":
     with st.spinner("Running combined dashboard..."):
-        data = cached_fusion(ticker, years, window, threshold)
+        data = cached_fusion(ticker, years, window, threshold, not fast_mode)
 
     final = data["final"]
     transcript = data["transcript"]
@@ -381,6 +438,15 @@ if page == "Final Verdict":
         f"Quote time: {transcript['liveQuote'].get('timestamp') or 'latest daily close'} | "
         f"Last updated: {data['updated']}"
     )
+    with st.expander("Macro tape: US, Canada, commodities", expanded=False):
+        market = transcript["market"]
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("SPY 1M", f"{market.get('spy_1m', 'n/a')}%")
+        m2.metric("QQQ 1M", f"{market.get('qqq_1m', 'n/a')}%")
+        m3.metric("TSX 1M", f"{market.get('tsx_1m', 'n/a')}%")
+        m4.metric("Gold 1M", f"{market.get('gold_1m', 'n/a')}%")
+        m5.metric("Silver 1M", f"{market.get('silver_1m', 'n/a')}%")
+        m6.metric("Oil 1M", f"{market.get('oil_1m', 'n/a')}%")
 
     left, right = st.columns([1.35, 0.85])
     with left:
